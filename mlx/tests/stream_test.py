@@ -7,8 +7,8 @@ PROOF_AT, EQ_AT, SIZE, MARK = 4096, 1 << 30, 1 << 33, 1048583
 path = tmp + "/stream.bin"
 fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600); os.ftruncate(fd, SIZE)
 m = mmap.mmap(fd, SIZE)
-open(tmp + "/mark.proof", "wb").write(b"\0" * MARK)
 proof = open(d + "/example.proof", "rb").read()
+open(tmp + "/mark.proof", "wb").write(proof[:12] + b"\0" * (MARK - 12))
 env = dict(os.environ, FP_STREAM=path)
 p = subprocess.Popen([comp, d + "/config", d + "/ivk", d + "/example.req", d + "/example.y", tmp + "/mark.proof", "-id", open(d + "/ID.txt").read().strip()],
                      env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
