@@ -70,6 +70,8 @@ struct LookupOut {
   E Cend = E::zero();           // hidden value of the key side's leaves at (zx | zy)
   E leaves_eps = E::zero();
   std::vector<E> zK;
+  std::vector<E> e;                // by call: the weight of its trees at zy
+  std::vector<std::vector<E>> zk;  // by call: its key point
 };
 // Ch adds to the sumcheck's channel: shift(), alpha(), point(round, n), line().
 template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const std::vector<LookupCall> &calls, const LookupSizes &s, const std::vector<std::vector<u32>> &mult) {
@@ -196,6 +198,14 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
   o.zy.assign(zK.begin() + s.dT, zK.end());
   o.zK = zK;
   o.Cend = CK;
+  o.e.assign(s.NC, E::one()), o.zk.resize(s.NC);
+  for (unsigned c = 0; c < s.NC; c++) {
+    const unsigned hi = s.rK - s.iota[c];
+    const u64 pre = (u64)s.tree0[c] >> s.iota[c];
+    for (unsigned i = 0; i < hi; i++) o.e[c] = o.e[c] * (((pre >> (hi - 1 - i)) & 1) ? o.zy[i] : E::one() - o.zy[i]);
+    o.zk[c].assign(o.zy.begin() + hi, o.zy.end());
+    o.zk[c].insert(o.zk[c].end(), o.zx.begin(), o.zx.end());
+  }
   // Step 6.
   for (unsigned m = 5; m < nT; m++) level(Tt[m + 1], m, zT, CT, CTpub, default_order(m));
   // Step 7.

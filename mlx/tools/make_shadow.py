@@ -117,7 +117,7 @@ funs = """{ std::vector<blk::u64> o; o.push_back(fun.size());
       for (auto &e_ : x_.phi) for (int k_ = 0; k_ < 3; k_++) o.push_back(eC(e_, k_)); }
     fp_log_bytes(fpstream::FUNS, o.data(), o.size() * 8); }
 """
-patch("vf_layers_check.inc", "  tl.closeFuns(fun);\n", funs + "  tl.closeFuns(fun);\n")
+patch("vf_layers_check.inc", "  rootInH(F, tr, {(int)iU3});\n  tl.closeFuns(fun);\n", funs + "  rootInH(F, tr, {(int)iU3});\n  tl.closeFuns(fun);\n")
 patch("vf_output_head_check.inc", "  tl.closeFuns(fun);\n", funs + "  tl.closeFuns(fun);\n")
 patch("vf_attention_check.h", "    seam.tl.closeFuns(fun);\n", funs + "    seam.tl.closeFuns(fun);\n")
 # The pending row: rows' weights from `first`, the point, beta, the target.
@@ -145,3 +145,10 @@ patch("vf_weights_layout.h", "  vector<Ex> rho;\n  WsForkOut o;\n", """  { std::
 patch("vf_transcript_calls.h", "static void trBatchRows(Tr &tr, u64 rows) { chainBatchRows(tr.one, rows); }", """static void trBatchRows(Tr &tr, u64 rows) { { uint64_t r_ = rows; fp_log_bytes(fpstream::ROWS, &r_, 8); } chainBatchRows(tr.one, rows); }""")
 patch("vf_transcript_calls.h", '#pragma once\n', '#pragma once\n#include <cstring>\n' + hooks)
 patch("vf_sumcheck_psc.h", '#include "iop/hp.h"\n' + hooks, '#include "iop/hp.h"\n')
+
+# The first query's words, before the proof is read.
+patch("cp_verify.cpp", "    const blk::IfTested verdict = blk::check_proof_if_tested(", """    { std::vector<uint8_t> b; auto put_ = [&](const void *p_, size_t n_) { const uint64_t m_ = n_; b.insert(b.end(), (const uint8_t *)&m_, (const uint8_t *)&m_ + 8); b.insert(b.end(), (const uint8_t *)p_, (const uint8_t *)p_ + n_); };
+      const std::vector<blk::u8> a_(requestH.begin(), requestH.end()), c_(fileWordsH.begin(), fileWordsH.end());
+      put_(a_.data(), a_.size()), put_(c_.data(), c_.size());
+      fp_log_bytes(fpstream::STATEMENT, b.data(), b.size()); }
+    const blk::IfTested verdict = blk::check_proof_if_tested(""")

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Commits to a model's weights on MLX: the native counterpart of cp_commit. It writes ivk/key.bin and
 // ivk/leaf/0.bin, which the unmodified cp_verify checks, and prints the commitment ID.
-// usage: fp_commit <config directory> <matrix.i8> <out directory>
+// usage: fp_commit <config directory> <matrix.i8> <out directory> <seed file>
+// The seed file is secret: it re-derives the tables' random entries, so that fp_prove can rebuild the
+// leaf table. It is made if it does not exist, readable by its owner alone, and it must not leave them.
 #include <chrono>
 #include <cstdio>
 #include <fstream>
@@ -16,6 +18,7 @@
 #include "frame/check_entry.h"
 #include "frame/check_key.h"
 #include "index_mlx.h"
+#include "seed_coins.h"
 using namespace blk;
 static std::string slurp(const std::string &p) {
   std::ifstream f(p, std::ios::binary);
@@ -30,7 +33,7 @@ static void spit(const std::string &p, const std::vector<u8> &b) {
   f.write((const char *)b.data(), b.size());
 }
 int main(int argc, char **argv) {
-  if (argc != 4) { fprintf(stderr, "usage: fp_commit <config directory> <matrix.i8> <out directory>\n"); return 2; }
+  if (argc != 5) { fprintf(stderr, "usage: fp_commit <config directory> <matrix.i8> <out directory> <seed file>\n"); return 2; }
   setvbuf(stdout, nullptr, _IOLBF, 0);
   const std::string cfg = argv[1], out = argv[3];
   const std::string pol = slurp(cfg + "/policy.txt"), lay = slurp(cfg + "/layout.txt"), kl = slurp(cfg + "/KL.bin");
@@ -48,7 +51,9 @@ int main(int argc, char **argv) {
     const int8_t *cells = (const int8_t *)raw.data();
     fpmlx::CellMatrix M{S.matrix_rows, columns, cells};
     const Digest inputs = CoinInputs().add("the public file", pol).finish();
-    auto coins = run_coins_without_a_seed<StreamCoins>(inputs, CoinContext{});
+    const CoinKey seed = fpmlx::load_or_make_seed(argv[4]);
+    auto coins = fpmlx::seeded_coins(seed, fpmlx::COINS_ANCHOR), key_coins = fpmlx::seeded_coins(seed, fpmlx::COINS_KEY);
+    auto leaf_coins = fpmlx::seeded_coins(seed, fpmlx::COINS_LEAF), link_coins = fpmlx::seeded_coins(seed, fpmlx::COINS_LINK);
     EngineMlx engine;
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     if (getenv("FP_STOP_AFTER_TABLE")) { fpmlx::IndexMlx t(S, M, *coins, c.configuration()); printf("table only: %.1f s\n", now() - t0); return 0; }
@@ -58,12 +63,12 @@ int main(int argc, char **argv) {
     fpmlx::MemberMlx products(S, M);
     Writer key;
     const double t1 = now();
-    if (!make_key(c, first, ranges, products, engine, *coins, search, key)) { fprintf(stderr, "fp_commit: make_key failed: a cell is out of its range\n"); return 3; }
+    if (!make_key(c, first, ranges, products, engine, *key_coins, search, key)) { fprintf(stderr, "fp_commit: make_key failed: a cell is out of its range\n"); return 3; }
     printf("key file: %zu bytes, %.1f s\n", key.bytes().size(), now() - t1); fflush(stdout);
     const double t2 = now();
-    fpmlx::IndexMlx further(S, M, *coins, c.configuration());
+    fpmlx::IndexMlx further(S, M, *leaf_coins, c.configuration());
     Writer entry;
-    if (!make_entry(c, first, further, engine, *coins, search, entry)) { fprintf(stderr, "fp_commit: make_entry failed\n"); return 3; }
+    if (!make_entry(c, first, further, engine, *link_coins, search, entry)) { fprintf(stderr, "fp_commit: make_entry failed\n"); return 3; }
     printf("leaf file: %zu bytes, %.1f s\n", entry.bytes().size(), now() - t2);
     mkdir(out.c_str(), 0700);
     mkdir((out + "/leaf").c_str(), 0700);

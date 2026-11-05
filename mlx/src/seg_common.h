@@ -4,6 +4,7 @@
 // packed arrays, the placing of arrays in an oracle message's main table, and the smallness test
 // (docs/format/11-1-machinery.md, third piece). See mlx/DESIGN_PROVER.md.
 #pragma once
+#include <functional>
 #include <map>
 #include <string>
 #include "iop/context.h"
@@ -15,6 +16,9 @@ namespace fpmlx {
 // The channel as psc_run() and lookup_run() use it.
 struct Chan {
   ProverRounds &r;
+  // pub(C), which the verifier's walk computes; null: the caller's own value stands.
+  std::function<E()> next_public;
+  E public_part(const E &x) { return next_public ? next_public() : x; }
   void send(const E &x) { r.send(x); }
   void send_hiding_sum(const E &x) { r.send_hiding_sum(x); }
   E epsilon() { return r.close_epsilon(R_PSC_EPSILON); }

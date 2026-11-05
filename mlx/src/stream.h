@@ -27,7 +27,7 @@ inline uint8_t *map(const char *path, bool create) {
 }
 inline Head *head(uint8_t *m) { return reinterpret_cast<Head *>(m); }
 // The log: records [type, bytes, payload], appended by the companion, read in order by fp_prove.
-enum Type : uint64_t { EQUATION = 1, PUBLIC = 2, FUNS = 3, PENDING = 4, CLAIMS = 5, ROWS = 6 };
+enum Type : uint64_t { EQUATION = 1, PUBLIC = 2, FUNS = 3, PENDING = 4, CLAIMS = 5, ROWS = 6, STATEMENT = 7 };
 inline uint8_t *companion_map();
 inline uint8_t *log_begin(uint8_t *m) { return m + EQ_AT + head(m)->eq_bytes.load(); }
 inline void log_end(uint8_t *m, uint8_t *start, uint8_t *end, uint64_t type) {
