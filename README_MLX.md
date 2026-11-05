@@ -1,3 +1,14 @@
+# FlashProve on Apple silicon
+
+Proves a request on the bundled synthetic model on a Mac, and checks it with the stock `cp_verify`:
+
+```
+mlx/demo.sh ~/fpwork/demo
+```
+
+It needs `.venv` with `mlx`, Homebrew's `gcc`, `llvm` and GNU tools. See `MLX_PORT_STATUS.md` for what
+was measured and for the limits: most of a proof's time is still on CPU threads.
+
 # FlashProve on MLX: reproducing the results
 
 The port is unfinished: see [MLX_PORT_STATUS.md](MLX_PORT_STATUS.md). These commands reproduce what
