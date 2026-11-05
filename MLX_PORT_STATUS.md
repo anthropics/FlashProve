@@ -1,7 +1,8 @@
 # MLX port: status
 
 Branch `mlx-port`. **The port is not finished: no model proof has been made with it yet.** Neither
-milestone of the task (synthetic model, SmolLM2) is done. Everything below is measured on an Apple
+milestone of the task (synthetic model, SmolLM2) is done. Native commitment is done; the request
+sub-proofs are not. Everything below is measured on an Apple
 M5 Pro (64 GB, macOS 27), MLX 0.32.4.
 
 ## Design
@@ -21,6 +22,7 @@ port and nothing here depends on it.
 | F and E arithmetic | `mlx/kernels/field.h.metal` | `field_test`: add, sub, mul, E mul equal to `blocks/field` on about 2^20 inputs each |
 | `EngineMlx`: encoding, BLAKE2b leaves and tree, evaluation, folds | `mlx/src/engine_mlx.h`, `mlx_kernels.cpp` | `engine_test`: root, openings, evaluation, fold rounds, folded rows equal to `EngineCpu` |
 | Whole toy protocols | `mlx/tests/toy_mlx.cpp`, `segments_mlx.cpp` | accepted, proof digests byte-identical to the CPU engine at seed 42 |
+| Native commitment | `mlx/src/fp_commit.cpp`, `index_mlx.h`, `mlx/tools/place_weights.py` | on `target_small_f2_roomy`: key and leaf files pass the unmodified `cp_verify` (`PART PASSED`); 4 tampered files refused (`key-refused`, `entry-refused`). 4 min 17 s, of which the key file 198 s (range proof on the CPU). Writes no `isk` yet |
 | Integer forward pass, with experts | `mlx/src/integer_forward.cpp` | `forward_test`: 191 tensors, 5,246,656 values equal to `model.py` on `target_small_f2_roomy` synthetic weights; one altered reference value makes it fail |
 
 ## Library tests with EngineMlx in place of EngineCpu (`mlx/run_library_tests.sh`)
@@ -31,7 +33,6 @@ survive a fork), so those children exercise the engine's guards, not its kernels
 
 ## Not done
 
-- Native `cp_commit`: the weight table, key file and leaf files.
 - Native `cp_prove`: the sub-proofs of a request (feed-forward, attention, head, lookups, range
   checks), specified in `docs/format/11-*.md`. This is the largest remaining part.
 - A proof accepted by `cp_verify`.
@@ -42,7 +43,8 @@ survive a fork), so those children exercise the engine's guards, not its kernels
 
 ## Known weak spots in what exists
 
-- `search_nonce` still runs on the CPU.
+- `WfCpu` and `MemberMlx` (range proof, `g^T M`) run on the CPU; Index `fold` and `record` too.
+- Encoding one table takes 22 s, far above what its bandwidth allows.
 - `exact_product` is a plain per-output kernel, not tiled.
 - Tables live on the host and are uploaded per use; `Form` expansion is on the CPU.
 - `encode_rows` needs fewer than 2^31 threads per call: no chunking yet, so large tables will fail.
@@ -51,7 +53,6 @@ survive a fork), so those children exercise the engine's guards, not its kernels
 
 ## Next
 
-1. Explain the open test failures, using a harness that does not fork after Metal starts.
-2. Native key file and leaf files through `wf_prove`, `rng_prove`, `link_prove`, using
-   `blocks/iop/tests/*_world.h` as templates, checked by `cp_verify`.
-3. Native sub-proofs, one segment kind at a time.
+1. Native sub-proofs behind `ReqSubProver` (`blocks/iop/req.h`), one segment kind at a time,
+   following `docs/format/11-*.md` and the verifier's walkers in `verifier/src/`.
+2. Move the key file's range proof (`WfCpu`) to the GPU.
