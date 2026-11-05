@@ -4,11 +4,24 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <pthread.h>
 #include <sstream>
 #ifndef FPMLX_KERNEL_DIR
 #error "FPMLX_KERNEL_DIR: the directory of mlx/kernels"
 #endif
 namespace fpmlx {
+static bool child_of_fork = false;
+static const bool watching = [] { pthread_atfork(nullptr, nullptr, [] { child_of_fork = true; }); return true; }();
+bool in_forked_child() { return child_of_fork; }
+Buf::Buf(const mx::array &a) {
+  mx::eval(a);
+  a_ = std::shared_ptr<mx::array>(new mx::array(a), [](mx::array *x) { if (!in_forked_child()) delete x; });
+  p_ = reinterpret_cast<const blk::u64 *>(a_->data<uint64_t>());
+  n_ = a_->size();
+}
+Buf::Buf(std::vector<blk::u64> host) : h_(std::make_shared<std::vector<blk::u64>>(std::move(host))) { p_ = h_->data(), n_ = h_->size(); }
+static blk::E e_at(const blk::u64 *d, size_t i) { blk::E x; for (int k = 0; k < 3; k++) x.c[k] = blk::F{d[3 * i + k]}; return x; }
+static void e_put(blk::u64 *d, size_t i, const blk::E &x) { for (int k = 0; k < 3; k++) d[3 * i + k] = x.c[k].v; }
 std::string read_kernel_header(const char *name) {
   std::ifstream f(std::string(FPMLX_KERNEL_DIR) + "/" + name);
   if (!f) throw std::runtime_error(std::string("no kernel file ") + name);
@@ -51,18 +64,36 @@ mx::array e_mul(const mx::array &a, const mx::array &b) {
               {a, b}, {"a", "b"}, a.shape(), a.size() / 3);
 }
 
-mx::array e_upload(const std::vector<blk::E> &v) {
+Buf e_upload(const std::vector<blk::E> &v) {
   static_assert(sizeof(blk::E) == 24, "E is three words");
-  return words(reinterpret_cast<const blk::u64 *>(v.data()), 3 * v.size());
+  const blk::u64 *w = reinterpret_cast<const blk::u64 *>(v.data());
+  if (in_forked_child()) return Buf(std::vector<blk::u64>(w, w + 3 * v.size()));
+  return Buf(words(w, 3 * v.size()));
 }
-std::vector<blk::E> e_download(const mx::array &a) {
-  mx::eval(a);
+std::vector<blk::E> e_download(const Buf &a) {
   std::vector<blk::E> out(a.size() / 3);
-  if (!out.empty()) memcpy((void *)out.data(), a.data<uint64_t>(), a.size() * 8);
+  if (!out.empty()) memcpy((void *)out.data(), a.data(), a.size() * 8);
   return out;
 }
-mx::array encode_rows(const blk::u64 *coefficients, size_t rows, unsigned ld, unsigned log_n, const blk::F *tw) {
+Buf encode_rows(const blk::u64 *coefficients, size_t rows, unsigned ld, unsigned log_n, const blk::F *tw) {
   const size_t block = size_t(1) << ld, n = size_t(1) << log_n;
+  if (in_forked_child()) {
+    std::vector<blk::u64> w(rows * n);
+    for (size_t r = 0; r < rows; r++) {
+      blk::u64 *a = &w[r * n];
+      for (size_t x = 0; x < n; x++) a[x] = coefficients[r * block + (x & (block - 1))];
+      for (unsigned L = ld; L-- > 0;) {
+        const size_t st = size_t(1) << L;
+        for (size_t h = 0; h < (n >> (L + 1)); h++)
+          for (size_t j = 0; j < st; j++) {
+            blk::u64 &p = a[2 * st * h + j], &q = a[2 * st * h + st + j];
+            const blk::u64 u = p, v = blk::GL64::mul(q, tw[(n >> (L + 1)) + h].v);
+            p = blk::GL64::add(u, v), q = blk::GL64::sub(u, v);
+          }
+      }
+    }
+    return Buf(std::move(w));
+  }
   const mx::array table = words(reinterpret_cast<const blk::u64 *>(tw), n);
   mx::array a = run("fp_spread", "uint i = thread_position_in_grid.x; uint n = p[0], block = p[1]; uint row = i / n, x = i % n; out[i] = c[(ulong)row * block + (x & (block - 1))];",
                     {words(coefficients, rows * block), words(std::vector<blk::u64>{n, block})}, {"c", "p"}, {{(int)(rows * n)}}, rows * n)[0];
@@ -76,9 +107,7 @@ mx::array encode_rows(const blk::u64 *coefficients, size_t rows, unsigned ld, un
             "out[base] = gl_add(u, v); out[base + st] = gl_sub(u, v);",
             {a, table, p}, {"a", "tw", "p"}, {{(int)(rows * n)}}, rows * n / 2)[0];
   }
-  a = mx::reshape(a, {(int)rows, (int)n});
-  mx::eval(a);
-  return a;
+  return Buf(a);
 }
 // Each thread adds a stride of products; the partial sums end on the host. Sums in F are exact, so
 // the order does not change them.
@@ -93,8 +122,14 @@ static blk::E sum_partials(const mx::array &p, size_t count, unsigned at, unsign
   }
   return s;
 }
-blk::E dot(const mx::array &a, const mx::array &b) {
-  const size_t n = a.size() / 3, T = std::min<size_t>(n, 1 << 16);
+blk::E dot(const Buf &A, const Buf &B) {
+  const size_t n = A.size() / 3, T = std::min<size_t>(n, 1 << 16);
+  if (in_forked_child()) {
+    blk::E s = blk::E::zero();
+    for (size_t j = 0; j < n; j++) s += e_at(A.data(), j) * e_at(B.data(), j);
+    return s;
+  }
+  const mx::array &a = A.array(), &b = B.array();
   const mx::array p = run("fp_dot",
                           "uint i = thread_position_in_grid.x; ulong T = q[0], n = q[1]; GlE s = {0, 0, 0};"
                           "for (ulong j = i; j < n; j += T) s = e_add(s, e_mul(GlE{a[3*j], a[3*j+1], a[3*j+2]}, GlE{b[3*j], b[3*j+1], b[3*j+2]}));"
@@ -102,8 +137,19 @@ blk::E dot(const mx::array &a, const mx::array &b) {
                           {a, b, words(std::vector<blk::u64>{T, n})}, {"a", "b", "q"}, {{(int)(3 * T)}}, T)[0];
   return sum_partials(p, T, 0, 3);
 }
-void fold_round(const mx::array &c, const mx::array &m, size_t rows, size_t len, blk::E q[3]) {
+void fold_round(const Buf &C, const Buf &M, size_t rows, size_t len, blk::E q[3]) {
   const size_t n = rows / 2 * len, T = std::min<size_t>(n, 1 << 16);
+  if (in_forked_child()) {
+    q[0] = q[1] = q[2] = blk::E::zero();
+    for (size_t b = 0; b < rows; b += 2)
+      for (size_t i = 0; i < len; i++) {
+        const blk::E c0 = e_at(C.data(), b * len + i), dc = e_at(C.data(), (b + 1) * len + i) - c0;
+        const blk::E m0 = e_at(M.data(), b * len + i), dm = e_at(M.data(), (b + 1) * len + i) - m0;
+        q[0] += c0 * m0, q[1] += c0 * dm + dc * m0, q[2] += dc * dm;
+      }
+    return;
+  }
+  const mx::array &c = C.array(), &m = M.array();
   const mx::array p = run("fp_fold_round",
                           "uint i = thread_position_in_grid.x; ulong T = w[0], n = w[1], len = w[2]; GlE s0 = {0,0,0}, s1 = {0,0,0}, s2 = {0,0,0};"
                           "for (ulong e = i; e < n; e += T) { ulong b = e / len, k = e % len, lo = 3 * (2 * b * len + k), hi = lo + 3 * len;"
@@ -114,15 +160,25 @@ void fold_round(const mx::array &c, const mx::array &m, size_t rows, size_t len,
                           {c, m, words(std::vector<blk::u64>{T, n, len})}, {"c", "m", "w"}, {{(int)(9 * T)}}, T)[0];
   for (int k = 0; k < 3; k++) q[k] = sum_partials(p, T, 3 * k, 9);
 }
-mx::array halve(const mx::array &t, size_t rows, size_t len, const blk::E &g) {
+Buf halve(const Buf &T, size_t rows, size_t len, const blk::E &g) {
   const size_t n = rows / 2 * len;
-  if (!n) return mx::zeros({0}, mx::uint64);
+  if (!n) return Buf(std::vector<blk::u64>());
+  if (in_forked_child()) {
+    std::vector<blk::u64> w(3 * n);
+    for (size_t b = 0; b < rows / 2; b++)
+      for (size_t i = 0; i < len; i++) {
+        const blk::E lo = e_at(T.data(), 2 * b * len + i), hi = e_at(T.data(), (2 * b + 1) * len + i);
+        e_put(w.data(), b * len + i, lo + g * (hi - lo));
+      }
+    return Buf(std::move(w));
+  }
+  const mx::array &t = T.array();
   const mx::array out = run("fp_halve",
                             "uint e = thread_position_in_grid.x; ulong len = w[0]; ulong b = e / len, k = e % len, lo = 3 * (2 * b * len + k), hi = lo + 3 * len;"
                             "GlE a = {t[lo], t[lo+1], t[lo+2]}, h = {t[hi], t[hi+1], t[hi+2]}, y = {w[1], w[2], w[3]};"
                             "GlE r = e_add(a, e_mul(y, e_sub(h, a))); out[3*e] = r.c0; out[3*e+1] = r.c1; out[3*e+2] = r.c2;",
                             {t, words(std::vector<blk::u64>{len, g.c[0].v, g.c[1].v, g.c[2].v})}, {"t", "w"}, {{(int)(3 * n)}}, n)[0];
-  return out;
+  return Buf(out);
 }
 blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits) { // not yet on the GPU
   for (blk::u64 nonce = 0;; nonce++)
@@ -134,7 +190,7 @@ OracleTreeMlx::OracleTreeMlx(const blk::OracleTreeShape &s, blk::Coins &coins) :
   coins.bytes(salt_.data(), salt_.size());
 }
 blk::Digest OracleTreeMlx::digest(unsigned d, blk::u64 place) const {
-  const uint64_t *w = level_[d].data<uint64_t>() + 4 * place;
+  const blk::u64 *w = level_[d].data() + 4 * place;
   blk::Digest r;
   for (int i = 0; i < 4; i++) r.w[2 * i] = (blk::u32)w[i], r.w[2 * i + 1] = (blk::u32)(w[i] >> 32);
   return r;
@@ -144,14 +200,37 @@ static std::vector<blk::u64> start_words(const blk::Tag &tag) {
   for (int i = 0; i < 4; i++) v[i] = tag.start.w[2 * i] | (blk::u64)tag.start.w[2 * i + 1] << 32;
   return v;
 }
-blk::Digest OracleTreeMlx::build(const std::vector<mx::array> &main, const std::vector<mx::array> &mask) {
+blk::Digest OracleTreeMlx::build(const std::vector<Buf> &main, const std::vector<Buf> &mask) {
   const blk::LeafHash lh(s_);
+  if (in_forked_child()) {
+    const size_t n = (size_t)1 << s_.log_n, nz = (size_t)1 << (s_.has_main() ? s_.log_n_zk : s_.log_n);
+    std::vector<blk::Digest> leaves(n);
+    std::vector<blk::F> col;
+    for (size_t x = 0; x < n; x++) {
+      col.clear();
+      for (const Buf &b : main) for (size_t r = 0; r < b.size() / n; r++) col.push_back(blk::F{b.data()[r * n + x]});
+      for (const Buf &b : mask) for (size_t r = 0; r < b.size() / nz; r++) col.push_back(blk::F{b.data()[r * nz + (x & (nz - 1))]});
+      leaves[x] = lh(x, col.data(), col.size(), salt_.data() + x * s_.salt_bytes);
+    }
+    const blk::TreeShape ts = s_.tree();
+    const blk::Tag tag = ts.vertex_tag();
+    level_.assign(s_.log_n + 1, Buf());
+    auto pack = [](const std::vector<blk::Digest> &v) { std::vector<blk::u64> w(4 * v.size()); for (size_t i = 0; i < v.size(); i++) for (int k = 0; k < 4; k++) w[4 * i + k] = v[i].w[2 * k] | (blk::u64)v[i].w[2 * k + 1] << 32; return Buf(std::move(w)); };
+    level_[s_.log_n] = pack(leaves);
+    for (unsigned d = s_.log_n; d > 0; d--) {
+      std::vector<blk::Digest> up((size_t)1 << (d - 1));
+      for (size_t i = 0; i < up.size(); i++) up[i] = blk::vertex(tag, leaves[2 * i], leaves[2 * i + 1]);
+      leaves = std::move(up);
+      level_[d - 1] = pack(leaves);
+    }
+    return digest(0, 0);
+  }
   const size_t n = (size_t)1 << s_.log_n, symbols = s_.width();
   const size_t salt_words = s_.salt_bytes / 8, salt_at = blk::leaf_salt_at(symbols, s_.salt_bytes) / 8, total = blk::leaf_bytes(symbols, s_.salt_bytes);
   // All main rows, then all mask rows, as one array of words, each at its own length.
   std::vector<mx::array> flat;
-  for (const mx::array &a : main) flat.push_back(mx::reshape(a, {-1}));
-  for (const mx::array &a : mask) flat.push_back(mx::reshape(a, {-1}));
+  for (const Buf &a : main) flat.push_back(a.array());
+  for (const Buf &a : mask) flat.push_back(a.array());
   const mx::array words_all = flat.empty() ? mx::zeros({1}, mx::uint64) : flat.size() == 1 ? flat[0] : mx::concatenate(flat);
   const size_t main_w = s_.main_width();
   const size_t nz = s_.has_mask() ? (size_t)1 << (s_.has_main() ? s_.log_n_zk : s_.log_n) : 1;
@@ -176,17 +255,18 @@ blk::Digest OracleTreeMlx::build(const std::vector<mx::array> &main, const std::
   const std::vector<blk::u64> vs = start_words(vt);
   vp.insert(vp.end(), vs.begin(), vs.end());
   const mx::array vpa = words(vp);
-  level_.assign(s_.log_n + 1, mx::array(0));
-  level_[s_.log_n] = leaves;
+  level_.assign(s_.log_n + 1, Buf());
+  mx::array level = leaves;
+  level_[s_.log_n] = Buf(level);
   for (unsigned d = s_.log_n; d > 0; d--) {
     const size_t half_n = (size_t)1 << (d - 1);
-    level_[d - 1] = run("fp_vertex",
+    level = run("fp_vertex",
       "uint i = thread_position_in_grid.x; ulong st[4] = {p[1], p[2], p[3], p[4]}; ulong h[8]; b2_begin(h, st); ulong m[16]; m[0] = p[0]; m[1] = 0;"
       "for (int k = 0; k < 8; k++) m[2 + k] = c[8 * (ulong)i + k]; for (int k = 10; k < 16; k++) m[k] = 0;"
       "b2_compress(h, m, 80, 0, true); for (int k = 0; k < 4; k++) out[4 * (ulong)i + k] = h[k];",
-      {level_[d], vpa}, {"c", "p"}, {{(int)(4 * half_n)}}, half_n)[0];
+      {level, vpa}, {"c", "p"}, {{(int)(4 * half_n)}}, half_n)[0];
+    level_[d - 1] = Buf(level);
   }
-  mx::eval(level_);
   return digest(0, 0);
 }
 }

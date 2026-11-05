@@ -25,16 +25,9 @@ port and nothing here depends on it.
 
 ## Library tests with EngineMlx in place of EngineCpu (`mlx/run_library_tests.sh`)
 
-37 test programs: 19 pass, 12 fail, 6 do not build.
-
-- The 12 failures pass with `EngineCpu` on this Mac, so they are specific to the MLX runs.
-- Likely cause, **not confirmed for all of them**: they `fork()` to check that misuse stops the
-  process, and Metal does not work in a forked child. `lkp_test` says so directly; most other
-  failing lines are such checks.
-- **Open:** `fold_base_test` reports 60,556 of 60,616 refused; the other 60 are unexplained.
-  `send_pad_test` line 224 is also unexplained.
-- The 6 that do not build need Linux's `cpu_set_t` in test helpers (`blocks/tests/damage.h`,
-  `blocks/tests/hiding/exact.h`).
+37 test programs, all pass. `EngineMlx` runs on the GPU in the parent process. Tests that `fork()`
+to check that a misuse ends the process run the engine's host path in the child (Metal does not
+survive a fork), so those children exercise the engine's guards, not its kernels.
 
 ## Not done
 

@@ -15,19 +15,39 @@ namespace mx = mlx::core;
 std::string read_kernel_header(const char *name);
 mx::array f_binary(const char *op, const mx::array &a, const mx::array &b); // "add" "sub" "mul"
 mx::array e_mul(const mx::array &a, const mx::array &b);
-mx::array e_upload(const std::vector<blk::E> &v);
-std::vector<blk::E> e_download(const mx::array &a);
+// Words that an engine keeps: an evaluated MLX array, whose memory the CPU reads too. Metal does not
+// survive fork(): in a forked child (the library's tests that check that a misuse ends the process)
+// a Buf holds host words and each operation below takes a plain host path. An array that a child
+// inherits is read, not released.
+bool in_forked_child();
+class Buf {
+public:
+  Buf() = default;
+  explicit Buf(const mx::array &a);
+  explicit Buf(std::vector<blk::u64> host);
+  const blk::u64 *data() const { return p_; }
+  size_t size() const { return n_; }
+  bool on_gpu() const { return (bool)a_; }
+  const mx::array &array() const { return *a_; }
+private:
+  std::shared_ptr<mx::array> a_;
+  std::shared_ptr<std::vector<blk::u64>> h_;
+  const blk::u64 *p_ = nullptr;
+  size_t n_ = 0;
+};
+Buf e_upload(const std::vector<blk::E> &v);
+std::vector<blk::E> e_download(const Buf &a);
 // rows x 2^log_dim coefficients to rows x 2^log_n symbols: Encoder::encode() on every row.
-mx::array encode_rows(const blk::u64 *coefficients, size_t rows, unsigned log_dim, unsigned log_n, const blk::F *tw);
-blk::E dot(const mx::array &a, const mx::array &b);
-void fold_round(const mx::array &c, const mx::array &m, size_t rows, size_t len, blk::E q[3]);
-mx::array halve(const mx::array &t, size_t rows, size_t len, const blk::E &g);
+Buf encode_rows(const blk::u64 *coefficients, size_t rows, unsigned log_dim, unsigned log_n, const blk::F *tw);
+blk::E dot(const Buf &a, const Buf &b);
+void fold_round(const Buf &c, const Buf &m, size_t rows, size_t len, blk::E q[3]);
+Buf halve(const Buf &t, size_t rows, size_t len, const blk::E &g);
 blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits);
 // blk::OracleTree with its leaves and vertices hashed on the GPU. The same draws from `coins`.
 class OracleTreeMlx {
 public:
   OracleTreeMlx(const blk::OracleTreeShape &s, blk::Coins &coins);
-  blk::Digest build(const std::vector<mx::array> &main, const std::vector<mx::array> &mask);
+  blk::Digest build(const std::vector<Buf> &main, const std::vector<Buf> &mask);
   template <class Fetch> void open(const blk::PositionList &list, blk::Opening &o, Fetch fetch) const {
     (void)blk::opening_given(s_, list);
     o = blk::Opening();
@@ -55,6 +75,6 @@ private:
   blk::Digest digest(unsigned depth, blk::u64 place) const;
   blk::OracleTreeShape s_;
   std::vector<blk::u8> salt_;
-  std::vector<mx::array> level_; // level_[d]: 2^d digests of 4 words
+  std::vector<Buf> level_; // level_[d]: 2^d digests of 4 words
 };
 }

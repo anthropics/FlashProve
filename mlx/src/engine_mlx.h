@@ -210,7 +210,7 @@ public:
       c->tail.push_back(std::move(tail));
     }
     c->tree = std::make_unique<fpmlx::OracleTreeMlx>(shape, coins);
-    std::vector<mx::array> main_words, mask_words;
+    std::vector<fpmlx::Buf> main_words, mask_words;
     for (const Words &w : c->main) if (w.rows) main_words.push_back(w.a);
     for (const Words &w : c->mask) if (w.rows) mask_words.push_back(w.a);
     root = c->tree->build(main_words, mask_words);
@@ -299,28 +299,28 @@ public:
     mine();
     const Folding &f = folding(id);
     BLK_REQUIRE(f.rows >= 2, "fold: no row variable is left");
-    fpmlx::fold_round(*f.gc, *f.gm, f.rows, f.ell, q);
+    fpmlx::fold_round(f.gc, f.gm, f.rows, f.ell, q);
   }
   void fold_bind(FoldId id, const E &gamma) override {
     mine();
     Folding &f = folding(id);
     BLK_REQUIRE(f.rows >= 2, "fold: no row variable is left");
-    f.gm = fpmlx::halve(*f.gm, f.rows, f.ell, gamma);
-    f.gc = fpmlx::halve(*f.gc, f.rows, f.ell, gamma);
-    f.gt = fpmlx::halve(*f.gt, f.rows, f.r, gamma);
+    f.gm = fpmlx::halve(f.gm, f.rows, f.ell, gamma);
+    f.gc = fpmlx::halve(f.gc, f.rows, f.ell, gamma);
+    f.gt = fpmlx::halve(f.gt, f.rows, f.r, gamma);
     f.rows /= 2;
   }
   TableId fold_end(FoldId id, Table &tail, TableId *c_folded = nullptr) override {
     mine();
     Folding &f = folding(id);
     BLK_REQUIRE(f.rows == 1, "fold: row variables are left");
-    const std::vector<E> fm = fpmlx::e_download(*f.gm), ft = fpmlx::e_download(*f.gt);
+    const std::vector<E> fm = fpmlx::e_download(f.gm), ft = fpmlx::e_download(f.gt);
     Table m(E_DEGREE, 1, f.ell);
     for (size_t i = 0; i < f.ell; i++) m.set(0, i, fm[i]);
     tail = Table(E_DEGREE, 1, f.r);
     for (size_t i = 0; i < f.r; i++) tail.set(0, i, ft[i]);
     if (c_folded) {
-      const std::vector<E> fc = fpmlx::e_download(*f.gc);
+      const std::vector<E> fc = fpmlx::e_download(f.gc);
       Table c(E_DEGREE, 1, f.ell);
       for (size_t i = 0; i < f.ell; i++) c.set(0, i, fc[i]);
       *c_folded = put(c);
@@ -340,7 +340,7 @@ private:
   // coordinate, in order.
   struct Words {
     size_t rows = 0, n = 0;
-    mx::array a = mx::array(0); // uint64, rows x n, on the GPU
+    fpmlx::Buf a; // rows x n
   };
   struct Committed {
     std::vector<OraclePart> parts;
@@ -356,7 +356,7 @@ private:
   struct Folding {
     size_t ell = 0, r = 0, rows = 0;
     std::vector<E> m, tail;   // only while fold_begin() gathers the rows
-    std::optional<mx::array> gm, gc, gt; // m, c and tail on the GPU, E entries, row by row
+    fpmlx::Buf gm, gc, gt; // m, c and tail on the GPU, E entries, row by row
     std::vector<CommitId> over;   // the trees whose rows are folded
     std::vector<TableId> hinted;  // the tables named by the `Form` that c was computed from
   };
@@ -421,7 +421,7 @@ private:
   // Appends the symbols at x of all rows, part by part, row by row.
   static void column(const std::vector<Words> &parts, u64 x, std::vector<F> &col) {
     for (const Words &p : parts)
-      for (size_t b = 0; b < p.rows; b++) col.push_back(F{p.a.data<uint64_t>()[b * p.n + x]});
+      for (size_t b = 0; b < p.rows; b++) col.push_back(F{p.a.data()[b * p.n + x]});
   }
   // What the leaf of position x holds: the main rows' symbols at x, behind them the mask rows' at the short position of x. So a
   // mask row's symbol at s is copied into every leaf whose x has the short position s (x modulo the
