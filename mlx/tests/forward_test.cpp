@@ -14,6 +14,7 @@ int main(int c, char **v) {
   long compared = 0, values = 0, bad = 0;
   std::set<std::string> seen;
   const Note note = [&](const std::string &name, const mx::array &a) {
+    if (name.rfind("sum_", 0) == 0) return; // no name in model.py
     auto it = record.find(name);
     if (it == record.end()) { printf("no reference for %s\n", name.c_str()); bad++; return; }
     mx::array want = mx::astype(it->second, mx::int64), got = mx::astype(a, mx::int64);

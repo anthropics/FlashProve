@@ -105,9 +105,10 @@ array forward(const ModelShape &p, const Tensors &w, const array &tokens, const 
     const array a = norm(x, k.M1, k.K1, p.eps1, note, "a", L);
     const array one = mx::full({n, p.dh / 2}, I(1ll << p.cs)), zero = mx::zeros({n, p.dh / 2}, mx::int64);
     const array C = k.rp ? cos_t : one, S = k.rp ? sin_t : zero;
-    const array qw = rq(rotary(exact_product(a, at(w, "Wq" + L)), C, S, p.n_h, p.dh), k.kq);
-    const array kw = rq(rotary(exact_product(a, at(w, "Wk" + L)), C, S, p.n_g, p.dh), k.kk);
-    const array vw = rq(exact_product(a, at(w, "Wv" + L)), k.kv);
+    const array Aq = rotary(exact_product(a, at(w, "Wq" + L)), C, S, p.n_h, p.dh), Ak = rotary(exact_product(a, at(w, "Wk" + L)), C, S, p.n_g, p.dh);
+    const array Av = exact_product(a, at(w, "Wv" + L));
+    const array qw = rq(Aq, k.kq), kw = rq(Ak, k.kk), vw = rq(Av, k.kv);
+    note("sum_q" + L, Aq), note("sum_k" + L, Ak), note("sum_v" + L, Av);
     const array q = clamp(qw, 2047), key = clamp(kw, 2047), v = clamp(vw, 2047);
     note("qw" + L, qw), note("q" + L, q), note("kw" + L, kw), note("k" + L, key), note("vw" + L, vw), note("v" + L, v);
     std::vector<array> heads;
@@ -127,16 +128,21 @@ array forward(const ModelShape &p, const Tensors &w, const array &tokens, const 
     }
     const array o = mx::concatenate(heads, 1);
     note("o" + L, o);
-    x = mx::add(x, rq(exact_product(o, at(w, "Wo" + L)), k.ko));
+    const array Ao = exact_product(o, at(w, "Wo" + L));
+    note("sum_o" + L, Ao);
+    x = mx::add(x, rq(Ao, k.ko));
     note("x_mid" + L, x);
     const array m = norm(x, k.M2, k.K2, p.eps2, note, "m", L);
     const int shared = k.experts ? p.fe : p.f;
-    array gw = rq(exact_product(m, at(w, "Wg" + L)), k.kg), u = rq(exact_product(m, at(w, "Wu" + L)), k.ku);
+    array Ag = exact_product(m, at(w, "Wg" + L)), Au = exact_product(m, at(w, "Wu" + L));
+    array gw = rq(Ag, k.kg), u = rq(Au, k.ku);
     array e_star = mx::zeros({n}, mx::int64);
     std::vector<array> gr, ur;
     array xr = m;
     if (k.experts) {
-      const array lw = rq(exact_product(m, at(w, "Wr" + L)), k.kr);
+      const array Ar = exact_product(m, at(w, "Wr" + L));
+      note("sum_r" + L, Ar);
+      const array lw = rq(Ar, k.kr);
       array lr = lw;
       if (p.rcl) lr = mx::add(mx::multiply(clamp(mx::right_shift(lw, I(3)), 2047), I(8)), mx::bitwise_and(lw, I(7)));
       e_star = first_argmax(lr);
@@ -144,15 +150,18 @@ array forward(const ModelShape &p, const Tensors &w, const array &tokens, const 
       const array sc = mx::take(Sig, mx::add(chosen, I(16384)), 0);
       xr = rq(mx::multiply(mx::expand_dims(sc, 1), m), 16);
       note("lr" + L, lr), note("e_star" + L, e_star), note("sc" + L, sc), note("xr" + L, xr);
-      array gsel = mx::zeros({n, p.fe}, mx::int64), usel = gsel;
+      array gsel = mx::zeros({n, p.fe}, mx::int64), usel = gsel, sg = gsel, su_ = gsel;
       for (int e = 0; e < p.NE; e++) {
         const std::string E = L + "." + std::to_string(e);
         const array mine = mx::expand_dims(mx::equal(e_star, I(e)), 1);
-        gsel = mx::where(mine, rq(exact_product(xr, at(w, "Wgr" + E)), k.kgR), gsel);
-        usel = mx::where(mine, rq(exact_product(xr, at(w, "Wur" + E)), k.kuR), usel);
+        const array eg = exact_product(xr, at(w, "Wgr" + E)), eu = exact_product(xr, at(w, "Wur" + E));
+        sg = mx::where(mine, eg, sg), su_ = mx::where(mine, eu, su_);
+        gsel = mx::where(mine, rq(eg, k.kgR), gsel);
+        usel = mx::where(mine, rq(eu, k.kuR), usel);
       }
       gw = mx::concatenate({gw, gsel}, 1);
       u = mx::concatenate({u, usel}, 1);
+      Ag = mx::concatenate({Ag, sg}, 1), Au = mx::concatenate({Au, su_}, 1);
     }
     array table_key = gw;
     if (p.gcl) {
@@ -161,7 +170,7 @@ array forward(const ModelShape &p, const Tensors &w, const array &tokens, const 
       table_key = mx::add(mx::multiply(clamp(gh, 127), I(256)), g0);
     }
     const array s = mx::take(Ts, mx::add(table_key, I(32768)), 0);
-    note("gw" + L, gw), note("key" + L, table_key), note("s" + L, s), note("u" + L, u);
+    note("gw" + L, gw), note("key" + L, table_key), note("s" + L, s), note("u" + L, u), note("sum_g" + L, Ag), note("sum_u" + L, Au);
     const array su = mx::multiply(s, u);
     array ad = exact_product(slice_cols(su, 0, shared), at(w, "Wd" + L));
     if (k.experts) {
@@ -172,6 +181,7 @@ array forward(const ModelShape &p, const Tensors &w, const array &tokens, const 
         ad = mx::add(ad, mx::where(mine, exact_product(sr, at(w, "Wdr" + E)), I(0)));
       }
     }
+    note("sum_d" + L, ad);
     x = mx::add(x, rq(ad, k.kd));
   }
   note("x_last", x);
