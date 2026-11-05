@@ -1,6 +1,7 @@
 // Copyright 2026 Anthropic PBC
 // SPDX-License-Identifier: Apache-2.0
 #include "mlx_kernels.h"
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -19,11 +20,24 @@ std::string read_kernel_header(const char *name) {
     if (l.rfind("#pragma once", 0)) out += l + "\n";
   return out;
 }
+static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal"};
+static std::string all_headers() { std::string h; for (const char *f : HEADERS) h += read_kernel_header(f); return h; }
+// One kernel by name, made once. n threads, in groups of up to 256.
+static std::vector<mx::array> run(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
+                                  const std::vector<mx::Shape> &shapes, size_t threads, const std::vector<std::string> &outs = {"out"}) {
+  static std::map<std::string, mx::fast::CustomKernelFunction> kernels;
+  auto it = kernels.find(name);
+  if (it == kernels.end()) it = kernels.emplace(name, mx::fast::metal_kernel(name, names, outs, body, all_headers())).first;
+  BLK_REQUIRE(threads < (1ull << 31), "mlx: too many threads for one kernel");
+  return it->second(in, shapes, std::vector<mx::Dtype>(shapes.size(), mx::uint64), {(int)threads, 1, 1}, {(int)std::min<size_t>(threads, 256), 1, 1}, {}, std::nullopt, false, {});
+}
+static mx::array words(const std::vector<blk::u64> &v) { return mx::array(reinterpret_cast<const uint64_t *>(v.data()), {(int)v.size()}, mx::uint64); }
+static mx::array words(const blk::u64 *v, size_t n) { return mx::array(reinterpret_cast<const uint64_t *>(v), {(int)n}, mx::uint64); }
 static mx::array run1(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names, mx::Shape shape, size_t threads) {
   static std::map<std::string, mx::fast::CustomKernelFunction> kernels;
   auto it = kernels.find(name);
   if (it == kernels.end())
-    it = kernels.emplace(name, mx::fast::metal_kernel(name, names, {"out"}, body, read_kernel_header("field.h.metal"))).first;
+    it = kernels.emplace(name, mx::fast::metal_kernel(name, names, {"out"}, body, all_headers())).first;
   return it->second(in, {shape}, {mx::uint64}, {(int)threads, 1, 1}, {(int)std::min<size_t>(threads, 256), 1, 1}, {}, std::nullopt, false, {})[0];
 }
 mx::array f_binary(const char *op, const mx::array &a, const mx::array &b) {
@@ -35,5 +49,144 @@ mx::array e_mul(const mx::array &a, const mx::array &b) {
               "uint i = thread_position_in_grid.x; GlE r = e_mul(GlE{a[3*i], a[3*i+1], a[3*i+2]}, GlE{b[3*i], b[3*i+1], b[3*i+2]});"
               "out[3*i] = r.c0; out[3*i+1] = r.c1; out[3*i+2] = r.c2;",
               {a, b}, {"a", "b"}, a.shape(), a.size() / 3);
+}
+
+mx::array e_upload(const std::vector<blk::E> &v) {
+  static_assert(sizeof(blk::E) == 24, "E is three words");
+  return words(reinterpret_cast<const blk::u64 *>(v.data()), 3 * v.size());
+}
+std::vector<blk::E> e_download(const mx::array &a) {
+  mx::eval(a);
+  std::vector<blk::E> out(a.size() / 3);
+  if (!out.empty()) memcpy((void *)out.data(), a.data<uint64_t>(), a.size() * 8);
+  return out;
+}
+mx::array encode_rows(const blk::u64 *coefficients, size_t rows, unsigned ld, unsigned log_n, const blk::F *tw) {
+  const size_t block = size_t(1) << ld, n = size_t(1) << log_n;
+  const mx::array table = words(reinterpret_cast<const blk::u64 *>(tw), n);
+  mx::array a = run("fp_spread", "uint i = thread_position_in_grid.x; uint n = p[0], block = p[1]; uint row = i / n, x = i % n; out[i] = c[(ulong)row * block + (x & (block - 1))];",
+                    {words(coefficients, rows * block), words(std::vector<blk::u64>{n, block})}, {"c", "p"}, {{(int)(rows * n)}}, rows * n)[0];
+  for (unsigned L = ld; L-- > 0;) {
+    const mx::array p = words(std::vector<blk::u64>{n, L});
+    a = run("fp_layer",
+            "uint i = thread_position_in_grid.x; uint n = p[0], L = p[1], st = 1u << L; uint half_n = n >> 1;"
+            "uint row = i / half_n, k = i % half_n, h = k >> L, j = k & (st - 1);"
+            "ulong base = (ulong)row * n + 2ul * st * h + j; ulong t = tw[(n >> (L + 1)) + h];"
+            "ulong u = a[base], v = gl_mul(a[base + st], t);"
+            "out[base] = gl_add(u, v); out[base + st] = gl_sub(u, v);",
+            {a, table, p}, {"a", "tw", "p"}, {{(int)(rows * n)}}, rows * n / 2)[0];
+  }
+  a = mx::reshape(a, {(int)rows, (int)n});
+  mx::eval(a);
+  return a;
+}
+// Each thread adds a stride of products; the partial sums end on the host. Sums in F are exact, so
+// the order does not change them.
+static blk::E sum_partials(const mx::array &p, size_t count, unsigned at, unsigned stride) {
+  mx::eval(p);
+  const uint64_t *d = p.data<uint64_t>();
+  blk::E s = blk::E::zero();
+  for (size_t i = 0; i < count; i++) {
+    blk::E x;
+    for (int k = 0; k < 3; k++) x.c[k] = blk::F{d[i * stride + at + k]};
+    s += x;
+  }
+  return s;
+}
+blk::E dot(const mx::array &a, const mx::array &b) {
+  const size_t n = a.size() / 3, T = std::min<size_t>(n, 1 << 16);
+  const mx::array p = run("fp_dot",
+                          "uint i = thread_position_in_grid.x; ulong T = q[0], n = q[1]; GlE s = {0, 0, 0};"
+                          "for (ulong j = i; j < n; j += T) s = e_add(s, e_mul(GlE{a[3*j], a[3*j+1], a[3*j+2]}, GlE{b[3*j], b[3*j+1], b[3*j+2]}));"
+                          "out[3*i] = s.c0; out[3*i+1] = s.c1; out[3*i+2] = s.c2;",
+                          {a, b, words(std::vector<blk::u64>{T, n})}, {"a", "b", "q"}, {{(int)(3 * T)}}, T)[0];
+  return sum_partials(p, T, 0, 3);
+}
+void fold_round(const mx::array &c, const mx::array &m, size_t rows, size_t len, blk::E q[3]) {
+  const size_t n = rows / 2 * len, T = std::min<size_t>(n, 1 << 16);
+  const mx::array p = run("fp_fold_round",
+                          "uint i = thread_position_in_grid.x; ulong T = w[0], n = w[1], len = w[2]; GlE s0 = {0,0,0}, s1 = {0,0,0}, s2 = {0,0,0};"
+                          "for (ulong e = i; e < n; e += T) { ulong b = e / len, k = e % len, lo = 3 * (2 * b * len + k), hi = lo + 3 * len;"
+                          "GlE c0 = {c[lo], c[lo+1], c[lo+2]}, c1 = {c[hi], c[hi+1], c[hi+2]}, m0 = {m[lo], m[lo+1], m[lo+2]}, m1 = {m[hi], m[hi+1], m[hi+2]};"
+                          "GlE dc = e_sub(c1, c0), dm = e_sub(m1, m0);"
+                          "s0 = e_add(s0, e_mul(c0, m0)); s1 = e_add(s1, e_add(e_mul(c0, dm), e_mul(dc, m0))); s2 = e_add(s2, e_mul(dc, dm)); }"
+                          "out[9*i] = s0.c0; out[9*i+1] = s0.c1; out[9*i+2] = s0.c2; out[9*i+3] = s1.c0; out[9*i+4] = s1.c1; out[9*i+5] = s1.c2; out[9*i+6] = s2.c0; out[9*i+7] = s2.c1; out[9*i+8] = s2.c2;",
+                          {c, m, words(std::vector<blk::u64>{T, n, len})}, {"c", "m", "w"}, {{(int)(9 * T)}}, T)[0];
+  for (int k = 0; k < 3; k++) q[k] = sum_partials(p, T, 3 * k, 9);
+}
+mx::array halve(const mx::array &t, size_t rows, size_t len, const blk::E &g) {
+  const size_t n = rows / 2 * len;
+  if (!n) return mx::zeros({0}, mx::uint64);
+  const mx::array out = run("fp_halve",
+                            "uint e = thread_position_in_grid.x; ulong len = w[0]; ulong b = e / len, k = e % len, lo = 3 * (2 * b * len + k), hi = lo + 3 * len;"
+                            "GlE a = {t[lo], t[lo+1], t[lo+2]}, h = {t[hi], t[hi+1], t[hi+2]}, y = {w[1], w[2], w[3]};"
+                            "GlE r = e_add(a, e_mul(y, e_sub(h, a))); out[3*e] = r.c0; out[3*e+1] = r.c1; out[3*e+2] = r.c2;",
+                            {t, words(std::vector<blk::u64>{len, g.c[0].v, g.c[1].v, g.c[2].v})}, {"t", "w"}, {{(int)(3 * n)}}, n)[0];
+  return out;
+}
+blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits) { // not yet on the GPU
+  for (blk::u64 nonce = 0;; nonce++)
+    if (blk::chain_work_passes(prefix, nonce, bits)) return nonce;
+}
+OracleTreeMlx::OracleTreeMlx(const blk::OracleTreeShape &s, blk::Coins &coins) : s_(s) {
+  BLK_REQUIRE(s_.valid(), "oracle tree: not a shape");
+  salt_.resize(((size_t)1 << s_.log_n) * s_.salt_bytes);
+  coins.bytes(salt_.data(), salt_.size());
+}
+blk::Digest OracleTreeMlx::digest(unsigned d, blk::u64 place) const {
+  const uint64_t *w = level_[d].data<uint64_t>() + 4 * place;
+  blk::Digest r;
+  for (int i = 0; i < 4; i++) r.w[2 * i] = (blk::u32)w[i], r.w[2 * i + 1] = (blk::u32)(w[i] >> 32);
+  return r;
+}
+static std::vector<blk::u64> start_words(const blk::Tag &tag) {
+  std::vector<blk::u64> v(4);
+  for (int i = 0; i < 4; i++) v[i] = tag.start.w[2 * i] | (blk::u64)tag.start.w[2 * i + 1] << 32;
+  return v;
+}
+blk::Digest OracleTreeMlx::build(const std::vector<mx::array> &main, const std::vector<mx::array> &mask) {
+  const blk::LeafHash lh(s_);
+  const size_t n = (size_t)1 << s_.log_n, symbols = s_.width();
+  const size_t salt_words = s_.salt_bytes / 8, salt_at = blk::leaf_salt_at(symbols, s_.salt_bytes) / 8, total = blk::leaf_bytes(symbols, s_.salt_bytes);
+  // All main rows, then all mask rows, as one array of words, each at its own length.
+  std::vector<mx::array> flat;
+  for (const mx::array &a : main) flat.push_back(mx::reshape(a, {-1}));
+  for (const mx::array &a : mask) flat.push_back(mx::reshape(a, {-1}));
+  const mx::array words_all = flat.empty() ? mx::zeros({1}, mx::uint64) : flat.size() == 1 ? flat[0] : mx::concatenate(flat);
+  const size_t main_w = s_.main_width();
+  const size_t nz = s_.has_mask() ? (size_t)1 << (s_.has_main() ? s_.log_n_zk : s_.log_n) : 1;
+  std::vector<blk::u64> par = {n, symbols, main_w, nz, salt_words, salt_at, total, lh.tag.word, (blk::u64)s_.log_n};
+  const std::vector<blk::u64> st = start_words(lh.tag);
+  par.insert(par.end(), st.begin(), st.end());
+  const mx::array salts = words(reinterpret_cast<const blk::u64 *>(salt_.data()), salt_.size() / 8);
+  mx::array leaves = run("fp_leaves",
+    "uint x = thread_position_in_grid.x; ulong n = p[0], symbols = p[1], main_w = p[2], nz = p[3], salt_w = p[4], salt_at = p[5], total = p[6];"
+    "ulong st[4] = {p[9], p[10], p[11], p[12]}; ulong h[8]; b2_begin(h, st); ulong m[16]; ulong words_n = total / 8, at = 0; uint step = 0;"
+    "ulong xs = x & (nz - 1);"
+    "while (at < words_n) { for (int k = 0; k < 16; k++) { ulong i = at + k, v = 0;"
+    " if (i == 0) v = p[7]; else if (i == 1) v = n + x;"
+    " else if (i - 2 < symbols) { ulong y = i - 2; v = y < main_w ? w[y * n + x] : w[main_w * n + (y - main_w) * nz + xs]; }"
+    " else if (i >= salt_at && i < salt_at + salt_w) v = salt[(ulong)x * salt_w + (i - salt_at)];"
+    " m[k] = v; }"
+    " at += 16; bool last = at >= words_n; b2_compress(h, m, last ? total : 128ul * (step + 1), 0, last); step++; }"
+    "for (int k = 0; k < 4; k++) out[4 * (ulong)x + k] = h[k];",
+    {words_all, salts, words(par)}, {"w", "salt", "p"}, {{(int)(4 * n)}}, n)[0];
+  const blk::Tag vt = s_.tree().vertex_tag();
+  std::vector<blk::u64> vp = {vt.word};
+  const std::vector<blk::u64> vs = start_words(vt);
+  vp.insert(vp.end(), vs.begin(), vs.end());
+  const mx::array vpa = words(vp);
+  level_.assign(s_.log_n + 1, mx::array(0));
+  level_[s_.log_n] = leaves;
+  for (unsigned d = s_.log_n; d > 0; d--) {
+    const size_t half_n = (size_t)1 << (d - 1);
+    level_[d - 1] = run("fp_vertex",
+      "uint i = thread_position_in_grid.x; ulong st[4] = {p[1], p[2], p[3], p[4]}; ulong h[8]; b2_begin(h, st); ulong m[16]; m[0] = p[0]; m[1] = 0;"
+      "for (int k = 0; k < 8; k++) m[2 + k] = c[8 * (ulong)i + k]; for (int k = 10; k < 16; k++) m[k] = 0;"
+      "b2_compress(h, m, 80, 0, true); for (int k = 0; k < 4; k++) out[4 * (ulong)i + k] = h[k];",
+      {level_[d], vpa}, {"c", "p"}, {{(int)(4 * half_n)}}, half_n)[0];
+  }
+  mx::eval(level_);
+  return digest(0, 0);
 }
 }
