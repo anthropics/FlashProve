@@ -33,7 +33,12 @@ struct PscJob {
   unsigned degree_y = 0;              // d_Y; 0 exactly if shown is 0
   E start_value = E::zero();          // the true value of C
   E start_public = E::zero();         // pub(C)
-  // Beside the maps: a term that the summand adds at the end only. None so far.
+  // A summand whose end values are no maps of the rounds (step 11, the merge). ends: from the challenges
+  // and the bound maps, the true end values, `shown` of them. at_end: the summand at given end values.
+  std::function<std::vector<E>(const std::vector<E> &challenges, const std::vector<E> &bound)> ends;
+  std::function<E(const std::vector<E> &values)> at_end;
+  // Masks of the end values, if they are not the mask row's entries (the merge's index-mask entry).
+  std::vector<E> end_masks;
 };
 struct PscResult {
   std::vector<E> challenges; // gamma_l in the order of the rounds, without Y
@@ -72,6 +77,7 @@ inline std::vector<E> interpolate(const std::vector<E> &v) {
 }
 // Ch: send(E), send_hiding_sum(E), epsilon(), round() -> E, y() -> E (not 0), values().
 template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob job) {
+  job.start_public = ch.public_part(job.start_public);
   const size_t n = job.vars.size();
   const bool has_y = job.shown > 0;
   std::vector<Weight<E>> all;
@@ -186,6 +192,7 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
     psi_done = psi_done * pl;
   }
   for (const auto &m : M) out.values.push_back(m.empty() ? E::zero() : m[0]);
+  if (job.ends) out.values = job.ends(out.challenges, out.values);
   if (has_y) {
     const size_t l = NV - 1;
     const unsigned d = all[l].d;
@@ -194,13 +201,15 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
     for (unsigned node = 0; node < d; node++) {
       const E y = E::from(from_u64(node));
       std::vector<E> val = out.values;
-      for (unsigned i = 0; i < job.shown; i++) val[i] = val[i] + y * mask[jE + i];
+      for (unsigned i = 0; i < job.shown; i++) val[i] = val[i] + y * (job.end_masks.empty() ? mask[jE + i] : job.end_masks[i]);
       E h = E::zero();
-      for (const Monomial &m : job.summand) {
-        E t = m.coeff;
-        for (unsigned k : m.maps) t = t * val[k];
-        h = h + t;
-      }
+      if (job.at_end) h = job.at_end(val);
+      else
+        for (const Monomial &m : job.summand) {
+          E t = m.coeff;
+          for (unsigned k : m.maps) t = t * val[k];
+          h = h + t;
+        }
       values[node] = h;
     }
     std::vector<E> g = interpolate(values);
@@ -215,7 +224,7 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
     slot += d - 1;
     out.first_end = slot;
     for (unsigned i = 0; i < job.shown; i++) {
-      const E v = out.values[i] + out.beta * mask[jE + i];
+      const E v = out.values[i] + out.beta * (job.end_masks.empty() ? mask[jE + i] : job.end_masks[i]);
       out.end_values.push_back(v);
       ch.send(v);
     }

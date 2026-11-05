@@ -141,3 +141,7 @@ patch("vf_weights_layout.h", "  vector<Ex> rho;\n  WsForkOut o;\n", """  { std::
   vector<Ex> rho;
   WsForkOut o;
 """)
+
+patch("vf_transcript_calls.h", "static void trBatchRows(Tr &tr, u64 rows) { chainBatchRows(tr.one, rows); }", """static void trBatchRows(Tr &tr, u64 rows) { { uint64_t r_ = rows; fp_log_bytes(fpstream::ROWS, &r_, 8); } chainBatchRows(tr.one, rows); }""")
+patch("vf_transcript_calls.h", '#pragma once\n', '#pragma once\n#include <cstring>\n' + hooks)
+patch("vf_sumcheck_psc.h", '#include "iop/hp.h"\n' + hooks, '#include "iop/hp.h"\n')

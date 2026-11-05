@@ -105,7 +105,9 @@ array forward(const ModelShape &p, const Tensors &w, const array &tokens, const 
     const array a = norm(x, k.M1, k.K1, p.eps1, note, "a", L);
     const array one = mx::full({n, p.dh / 2}, I(1ll << p.cs)), zero = mx::zeros({n, p.dh / 2}, mx::int64);
     const array C = k.rp ? cos_t : one, S = k.rp ? sin_t : zero;
-    const array Aq = rotary(exact_product(a, at(w, "Wq" + L)), C, S, p.n_h, p.dh), Ak = rotary(exact_product(a, at(w, "Wk" + L)), C, S, p.n_g, p.dh);
+    const array pq = exact_product(a, at(w, "Wq" + L)), pk = exact_product(a, at(w, "Wk" + L));
+    note("sum_preq" + L, pq), note("sum_prek" + L, pk);
+    const array Aq = rotary(pq, C, S, p.n_h, p.dh), Ak = rotary(pk, C, S, p.n_g, p.dh);
     const array Av = exact_product(a, at(w, "Wv" + L));
     const array qw = rq(Aq, k.kq), kw = rq(Ak, k.kk), vw = rq(Av, k.kv);
     note("sum_q" + L, Aq), note("sum_k" + L, Ak), note("sum_v" + L, Av);

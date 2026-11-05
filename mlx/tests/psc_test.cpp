@@ -15,6 +15,7 @@ struct Mock {
   E round() { return draw(); }
   E y() { return draw(); }
   void values() {}
+  E public_part(const E &x) { return x; }
 };
 static int run(int n, int plain_every, int shown_n, bool squares, int order_rev) {
   // Summand: m0 * m1 (+ m2 kept) or with shown maps.
