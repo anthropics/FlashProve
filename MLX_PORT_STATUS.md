@@ -23,6 +23,8 @@ port and nothing here depends on it.
 | `EngineMlx`: encoding, BLAKE2b leaves and tree, evaluation, folds | `mlx/src/engine_mlx.h`, `mlx_kernels.cpp` | `engine_test`: root, openings, evaluation, fold rounds, folded rows equal to `EngineCpu` |
 | Whole toy protocols | `mlx/tests/toy_mlx.cpp`, `segments_mlx.cpp` | accepted, proof digests byte-identical to the CPU engine at seed 42 |
 | Native commitment | `mlx/src/fp_commit.cpp`, `index_mlx.h`, `mlx/tools/place_weights.py` | on `target_small_f2_roomy`: key and leaf files pass the unmodified `cp_verify` (`PART PASSED`); 4 tampered files refused (`key-refused`, `entry-refused`). 4 min 17 s, of which the key file 198 s (range proof on the CPU). Writes no `isk` yet |
+| Verifier companion | `mlx/build_companion.sh`, `mlx/tools/make_shadow.py`, `mlx/tests/stream_test.py` | the stored example proof, streamed 4 KB at a time through shared memory: `YES`, 5 segment equations exported |
+| Masked sumcheck prover | `mlx/src/psc_prover.h`, `mlx/tests/psc_test.cpp` | 66 configurations (equality, plain, mixed rounds, shown values, bit orders): the claim `Left(C; S0; K) = 0` holds |
 | Integer forward pass, with experts | `mlx/src/integer_forward.cpp` | `forward_test`: 191 tensors, 5,246,656 values equal to `model.py` on `target_small_f2_roomy` synthetic weights; one altered reference value makes it fail |
 
 ## Library tests with EngineMlx in place of EngineCpu (`mlx/run_library_tests.sh`)
@@ -53,6 +55,8 @@ survive a fork), so those children exercise the engine's guards, not its kernels
 
 ## Next
 
-1. Native sub-proofs behind `ReqSubProver` (`blocks/iop/req.h`), one segment kind at a time,
-   following `docs/format/11-*.md` and the verifier's walkers in `verifier/src/`.
+1. Native sub-proofs behind `ReqSubProver` (`blocks/iop/req.h`), by `mlx/DESIGN_PROVER.md`. Written
+   but not yet run against the companion: `lookup_prover.h`, `seg_common.h` (smallness test, array
+   placing). Not written: the feed-forward segment (cells, keys, panels), the attention segment, the
+   output head, `fp_prove` and the frame after the first chain.
 2. Move the key file's range proof (`WfCpu`) to the GPU.
