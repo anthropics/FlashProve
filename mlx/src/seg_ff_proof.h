@@ -158,9 +158,15 @@ inline void FFProver::before_u3(Chan &ch, Companion &io, const E *mask, u32 &slo
   const unsigned lPd = clog2u(d), lPf = clog2u(f), lfe = clog2u(std::max(fe, 1)), lNI = ll + 1, NS = 2 * XL - 1;
   const u64 Pd = 1ull << lPd, Pf = 1ull << lPf;
   const bool hasE = g == 0;
-  // FP_TAMPER_SCALAR=n: a negative test, the hidden value of scalar n is sent wrong.
-  const char *tamper = getenv("FP_TAMPER_SCALAR");
-  auto hide = [&](const E &v) { ch.send(v + mask[slot] + (tamper && (u32)atoi(tamper) == slot ? E::one() : E::zero())); slot++; };
+  // FP_TAMPER_HIDDEN=n: a negative test, the n-th hidden value sent alone is wrong.
+  const char *tamper = getenv("FP_TAMPER_HIDDEN");
+  int hidden_no = 0;
+  auto hide = [&](const E &v) {
+    const bool bad = tamper && atoi(tamper) == hidden_no++;
+    if (bad) printf("tampering with the hidden value of scalar %u\n", slot);
+    ch.send(v + mask[slot] + (bad ? E::one() : E::zero()));
+    slot++;
+  };
   // Step 1.
   const LookupOut lk = lookup_run(ch, mask, slot, G_.calls, sizes_, mult_);
   const std::vector<E> zt(lk.zx.end() - lt, lk.zx.end());
