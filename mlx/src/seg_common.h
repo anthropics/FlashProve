@@ -37,7 +37,13 @@ struct Chan {
   std::vector<E> point_join(size_t n) { return point(R_LKP_PLANES, n); }
   std::vector<E> point_zero(size_t n) { return point(R_ZERO, n); }
   E batch(u64 rows) { auto d = r.close_algebraic(R_BAT_SIGMA); d.require_rows(rows); return d.draw(); }
-  E batch_open() { return r.close_algebraic(R_BAT_SIGMA).draw(); }
+  // The segment's last batching: the number of its rows comes from the verifier's walk.
+  std::function<u64()> next_rows;
+  E batch_open() {
+    auto d = r.close_algebraic(R_BAT_SIGMA);
+    if (next_rows) d.require_rows(next_rows());
+    return d.draw();
+  }
 };
 // eq(z, i), the coordinate of the highest bit first.
 inline E eq_at(const std::vector<E> &z, u64 i) {

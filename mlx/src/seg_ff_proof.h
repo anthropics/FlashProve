@@ -120,14 +120,9 @@ public:
     arrays["U3"] = std::move(U);
   }
   // Steps 18 and 19.
-  void after_digits(Chan &ch, Companion &io, const E *mask, u32 &slot) {
+  void after_digits(Chan &ch, const E *mask, u32 &slot) {
     small.run_lookup(ch, mask, slot);
-    auto d = ch.r.close_algebraic(R_BAT_SIGMA);
-    const std::vector<u8> rows = io.take(fpstream::ROWS);
-    u64 n;
-    memcpy(&n, rows.data(), 8);
-    d.require_rows(n);
-    (void)d.draw();
+    (void)ch.batch_open();
   }
 private:
   const FFInput &in_;
