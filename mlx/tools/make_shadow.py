@@ -71,8 +71,7 @@ inline void fp_put_iw(u8 *&w, const IndexWeights &x) {
 inline void fp_export_equation(const ReqEquation &eq) {
   u8 *m = fpstream::companion_map();
   if (!m) return;
-  fpstream::Head *h = fpstream::head(m);
-  u8 *start = m + fpstream::EQ_AT + h->eq_bytes.load(), *w = start;
+  u8 *start = fpstream::log_begin(m), *w = start + 16;
   fp_put_u64(w, eq.terms.size());
   for (const ReqTerm &t : eq.terms) {
     fp_put_u64(w, t.born), fp_put_u64(w, t.array.size()), fp_put(w, t.array.data(), t.array.size());
@@ -81,10 +80,64 @@ inline void fp_export_equation(const ReqEquation &eq) {
   }
   fp_put_es(w, eq.on_masks);
   fp_put(w, &eq.target, sizeof(E));
-  h->eq_bytes.fetch_add((u64)(w - start));
-  h->eq_count.fetch_add(1);
+  fpstream::log_end(m, start, w, fpstream::EQUATION);
 }
 // Builds a segment's linear claim.'''
 assert old in s; s = s.replace(old, new, 1)
 s = s.replace('#pragma once\n', '#pragma once\n#include <cstring>\n#include "stream.h"\n', 1)
 open(out + "/iop/req_rows.h", "w").write(s)
+
+# The verifier's sources, copied, with hooks that export what it computes.
+import shutil
+v = out + "/vsrc"
+if os.path.exists(v): shutil.rmtree(v)
+shutil.copytree(root + "/verifier/src", v)
+def patch(name, old, new):
+    p = v + "/" + name
+    t = open(p).read()
+    assert old in t, (name, old)
+    open(p, "w").write(t.replace(old, new, 1))
+hooks = """#include "stream.h"
+static inline void fp_log_bytes(uint64_t type, const void *p, size_t n) {
+  uint8_t *m = fpstream::companion_map();
+  if (!m) return;
+  uint8_t *s = fpstream::log_begin(m);
+  memcpy(s + 16, p, n);
+  fpstream::log_end(m, s, s + 16 + n, type);
+}
+"""
+patch("vf_sumcheck_psc.h", '#include "iop/hp.h"\n', '#include "iop/hp.h"\n' + hooks)
+patch("vf_sumcheck_psc.h", "  Psc p;\n  p.target = target;\n", """  Psc p;
+  p.target = target;
+  { const blk::u64 w[3] = {eC(target, 0), eC(target, 1), eC(target, 2)}; fp_log_bytes(fpstream::PUBLIC, w, sizeof w); }
+""")
+# U3's parts: matrix, run length, weights.
+funs = """{ std::vector<blk::u64> o; o.push_back(fun.size());
+    for (auto &x_ : fun) { o.push_back((blk::u64)x_.M); o.push_back(x_.L); o.push_back(x_.at); o.push_back(x_.phi.size());
+      for (auto &e_ : x_.phi) for (int k_ = 0; k_ < 3; k_++) o.push_back(eC(e_, k_)); }
+    fp_log_bytes(fpstream::FUNS, o.data(), o.size() * 8); }
+"""
+patch("vf_layers_check.inc", "  tl.closeFuns(fun);\n", funs + "  tl.closeFuns(fun);\n")
+patch("vf_output_head_check.inc", "  tl.closeFuns(fun);\n", funs + "  tl.closeFuns(fun);\n")
+patch("vf_attention_check.h", "    seam.tl.closeFuns(fun);\n", funs + "    seam.tl.closeFuns(fun);\n")
+# The pending row: rows' weights from `first`, the point, beta, the target.
+patch("vf_weights_pending_claim.h", "  p.g = blk::member_weights_on_rows(S, first, std::move(values));\n", """  const std::vector<blk::E> fp_values = *values;
+  p.g = blk::member_weights_on_rows(S, first, std::move(values));
+""")
+patch("vf_weights_pending_claim.h", "  p.beta = toBlkE(o.beta), p.target = toBlkE(o.fvp);\n", """  p.beta = toBlkE(o.beta), p.target = toBlkE(o.fvp);
+  { std::vector<blk::u64> b; b.push_back(first); b.push_back(fp_values.size());
+    for (auto &e_ : fp_values) for (int k_ = 0; k_ < 3; k_++) b.push_back(e_.c[k_].v);
+    b.push_back(p.psi.size());
+    for (auto &e_ : p.psi) for (int k_ = 0; k_ < 3; k_++) b.push_back(e_.c[k_].v);
+    for (int k_ = 0; k_ < 3; k_++) b.push_back(p.beta.c[k_].v);
+    for (int k_ = 0; k_ < 3; k_++) b.push_back(p.target.c[k_].v);
+    fp_log_bytes(fpstream::PENDING, b.data(), b.size() * 8); }
+""")
+
+patch("vf_weights_layout.h", "  vector<Ex> rho;\n  WsForkOut o;\n", """  { std::vector<blk::u64> b; b.push_back(cl.size());
+    auto ve = [&](const vector<Ex> &v) { b.push_back(v.size()); for (auto &e_ : v) for (int k_ = 0; k_ < 3; k_++) b.push_back(eC(e_, k_)); };
+    for (auto &c : cl) { b.push_back(c.ui); b.push_back(c.f.size()); for (auto &f_ : c.f) ve(f_.HV), ve(f_.pt), ve(f_.AV); }
+    fp_log_bytes(fpstream::CLAIMS, b.data(), b.size() * 8); }
+  vector<Ex> rho;
+  WsForkOut o;
+""")
