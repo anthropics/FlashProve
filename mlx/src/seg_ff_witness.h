@@ -4,6 +4,7 @@
 // of digits, and the keys of the lookup of step 1. Every key must be a row of its call's table, which
 // lookup_multiplicities() tests.
 #pragma once
+#include <array>
 #include <fstream>
 #include <sstream>
 #include "integer_forward.h"
