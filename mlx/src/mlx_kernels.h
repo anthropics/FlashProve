@@ -48,6 +48,8 @@ class OracleTreeMlx {
 public:
   OracleTreeMlx(const blk::OracleTreeShape &s, blk::Coins &coins);
   blk::Digest build(const std::vector<Buf> &main, const std::vector<Buf> &mask);
+  // A table of main rows only, in chunks of equal numbers of rows: no copy joins them.
+  blk::Digest build_chunks(const std::vector<Buf> &chunks, size_t rows_each);
   template <class Fetch> void open(const blk::PositionList &list, blk::Opening &o, Fetch fetch) const {
     (void)blk::opening_given(s_, list);
     o = blk::Opening();
@@ -72,6 +74,7 @@ public:
     o.given = std::move(side.out);
   }
 private:
+  blk::Digest levels(const mx::array &leaves);
   blk::Digest digest(unsigned depth, blk::u64 place) const;
   blk::OracleTreeShape s_;
   std::vector<blk::u8> salt_;
