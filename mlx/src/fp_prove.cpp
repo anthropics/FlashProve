@@ -35,11 +35,24 @@ int main(int argc, char **argv) {
   if (argc != 10) { fprintf(stderr, "usage: fp_prove <config> <ivk> <reference> <seed> <request> <y> <id> <out proof> <companion>\n"); return 2; }
   setvbuf(stdout, nullptr, _IOLBF, 0);
   const std::string cfg = argv[1], ivk = argv[2], ref = argv[3], seedf = argv[4], reqf = argv[5], id = argv[7], outp = argv[8], comp = argv[9];
-  const u32 y = (u32)atoi(argv[6]);
   const std::string pol_t = slurp(cfg + "/policy.txt"), lay = slurp(cfg + "/layout.txt"), kl = slurp(cfg + "/KL.bin");
   std::vector<uint32_t> KL(kl.size() / 4);
   memcpy(KL.data(), kl.data(), kl.size());
   const std::string raw = slurp(ref + "/matrix.i8"), req = slurp(reqf);
+  const ModelShape shape = read_shape(ref + "/params.txt");
+  const Tensors W = [&] { auto l = mx::load_safetensors(ref + "/weights.safetensors"); Tensors t; for (auto &kv : l.first) t.emplace(kv.first, kv.second); return t; }();
+  const Policy pol = Policy::read(pol_t);
+  std::vector<u32> tokens(shape.T);
+  memcpy(tokens.data(), req.data(), 4 * shape.T);
+  std::vector<int32_t> tk(tokens.begin(), tokens.end());
+  const mx::array tok_a(tk.data(), {(int)tk.size()}, mx::int32);
+  const double t1 = now();
+  const Values V = capture_forward(shape, W, tok_a);
+  const CallTables tabs = call_tables(W);
+  printf("forward: %.1f s\n", now() - t1);
+  HeadRequest q0 = HeadRequest::read(req, shape.T);
+  const u32 y = strcmp(argv[6], "auto") ? (u32)atoi(argv[6]) : head_next_token(V, q0, shape.T);
+  printf("next token: %u\n", y);
   // The stream, the marker file and the companion.
   const std::string dir = outp + ".work";
   mkdir(dir.c_str(), 0700);
@@ -74,23 +87,13 @@ int main(int argc, char **argv) {
     const int8_t *cells = (const int8_t *)raw.data();
     CellMatrix M{S.matrix_rows, columns, cells};
     const CoinKey seed = load_or_make_seed(seedf.c_str());
-    auto leaf_coins = seeded_coins(seed, COINS_LEAF), coins = seeded_coins(seed, COINS_REQUEST);
+    auto leaf_coins = seeded_coins(seed, COINS_LEAF);
+    // A request's masks must be fresh: two proofs under one mask would show differences of hidden values.
+    auto coins = run_coins_without_a_seed<StreamCoins>(CoinInputs().add("a request", req).finish(), CoinContext{});
     EngineMlx engine;
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     IndexMlx table(S, M, *leaf_coins, c.configuration());
     printf("leaf table: %.1f s\n", now() - t0);
-    // The model.
-    const ModelShape shape = read_shape(ref + "/params.txt");
-    const Tensors W = [&] { auto l = mx::load_safetensors(ref + "/weights.safetensors"); Tensors t; for (auto &kv : l.first) t.emplace(kv.first, kv.second); return t; }();
-    const Policy pol = Policy::read(pol_t);
-    std::vector<u32> tokens(shape.T);
-    memcpy(tokens.data(), req.data(), 4 * shape.T);
-    std::vector<int32_t> tk(tokens.begin(), tokens.end());
-    const mx::array tok_a(tk.data(), {(int)tk.size()}, mx::int32);
-    const double t1 = now();
-    const Values V = capture_forward(shape, W, tok_a);
-    const CallTables tabs = call_tables(W);
-    printf("forward: %.1f s\n", now() - t1);
     const WeightInts wi(W);
     const Units units = Units::of(shape, S.k_col());
     // The statement, from the walk.
@@ -236,7 +239,7 @@ int main(int argc, char **argv) {
     Sealed seal;
     BLK_REQUIRE(ch.seal(R_SEAL, seal), "a prover's channel does not refuse");
     ch.finish_inside_a_file();
-    printf("first chain sealed: %zu bytes, %.1f s\n", file.size(), now() - t1);
+    printf("first chain sealed: %zu bytes, %.1f s\n", file.size(), now() - t0);
     LinBinding binding(c.fixed().binding, c.fixed().configuration, *coins);
     binding.put(0, seal.digest());
     binding.write_path(file, 0);
