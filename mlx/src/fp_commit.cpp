@@ -13,6 +13,7 @@
 #include <thread>
 #include "cp_configured.h"
 #include "coins/run_coins.h"
+#include "lkp_mlx.h"
 #include "engine/sumcheck_cpu.h"
 #include "engine_mlx.h"
 #include "frame/check_entry.h"
@@ -54,12 +55,13 @@ int main(int argc, char **argv) {
     const CoinKey seed = fpmlx::load_or_make_seed(argv[4]);
     auto coins = fpmlx::seeded_coins(seed, fpmlx::COINS_ANCHOR), key_coins = fpmlx::seeded_coins(seed, fpmlx::COINS_KEY);
     auto leaf_coins = fpmlx::seeded_coins(seed, fpmlx::COINS_LEAF), link_coins = fpmlx::seeded_coins(seed, fpmlx::COINS_LINK);
+    fpmlx::mx::set_cache_limit((size_t)4e9); // MLX keeps freed buffers for reuse, by default as much again as is in use
     EngineMlx engine;
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     if (getenv("FP_STOP_AFTER_TABLE")) { fpmlx::IndexMlx t(S, M, *coins, c.configuration()); printf("table only: %.1f s\n", now() - t0); return 0; }
     fpmlx::IndexMlx first(S, M, *coins, c.configuration());
     printf("anchor table: %.1f s\n", now() - t0); fflush(stdout);
-    WfCpu ranges(f.ranges, wf_matrix_of(S), [&](u64 row, u64 column) { return from_i64(cells[row * columns + column]); });
+    fpmlx::WfMlx ranges(f.ranges, wf_matrix_of(S), [&](u64 row, u64 column) { return from_i64(cells[row * columns + column]); });
     fpmlx::MemberMlx products(S, M);
     Writer key;
     const double t1 = now();

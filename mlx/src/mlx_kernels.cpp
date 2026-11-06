@@ -455,8 +455,7 @@ void SumRounds::prepare(const std::vector<SumWeight> &later) {
   w_ = std::move(w);
 }
 std::vector<blk::E> SumRounds::nodes(size_t l, unsigned d, size_t step) {
-  const size_t pairs = size_ / 2, T = std::min<size_t>(pairs, size_t(1) << 15), G = (T + 255) / 256;
-  BLK_REQUIRE(T % 256 == 0, "sumcheck on the GPU: too few pairs");
+  const size_t pairs = size_ / 2, T = std::max<size_t>(256, std::min<size_t>(pairs, size_t(1) << 15)), G = T / 256; // the sums of a group take 256 threads
   const bool any = (sum_factors(shape_) + used_.size()) * d > 96;
   BLK_REQUIRE(d <= 16, "sumcheck on the GPU: a round of too high a degree");
   const mx::array p = words(std::vector<blk::u64>{pairs, step, T, size_, d, shape_.coeff.size()});
