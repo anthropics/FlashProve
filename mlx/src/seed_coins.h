@@ -8,6 +8,7 @@
 #include <memory>
 #include <unistd.h>
 #include "coins/run_coins.h"
+#include "metal_coins.h"
 namespace fpmlx {
 using namespace blk;
 enum : u32 { COINS_ANCHOR = 101, COINS_KEY = 102, COINS_LEAF = 103, COINS_LINK = 104, COINS_REQUEST = 105 };
@@ -28,7 +29,7 @@ inline CoinKey load_or_make_seed(const char *path) {
 }
 inline std::unique_ptr<StreamCoins> seeded_coins(const CoinKey &seed, u32 use) {
   CoinKey child = seed_child(seed, use, 0);
-  auto c = std::make_unique<StreamCoins>(child, CoinContext{});
+  auto c = std::make_unique<MetalCoins>(child, CoinContext{});
   wipe(child);
   return c;
 }

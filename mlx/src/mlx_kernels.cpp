@@ -35,7 +35,7 @@ std::string read_kernel_header(const char *name) {
     if (l.rfind("#pragma once", 0)) out += l + "\n";
   return out;
 }
-static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal", "sumcheck.h.metal"};
+static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal", "sumcheck.h.metal", "chacha.h.metal"};
 static std::string all_headers() { std::string h; for (const char *f : HEADERS) h += read_kernel_header(f); return h; }
 // One kernel by name, made once. n threads, in groups of up to 256.
 static std::vector<mx::array> run(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
@@ -585,5 +585,23 @@ Buf rows_first(const Buf &dense, size_t rows, size_t ell) {
   return Buf(run("fp_rows_first",
                  "ulong b = thread_position_in_grid.x, i = thread_position_in_grid.y, rows = p[0], ell = p[1]; e_st(out, b * ell + i, e_ld(a, b + rows * i));",
                  {dense.array(), words(std::vector<blk::u64>{rows, ell})}, {"a", "p"}, {{(int)(3 * rows * ell)}}, rows, ell)[0]);
+}
+Buf chacha_words(const blk::u32 key[8], blk::u32 stream, size_t n) {
+  std::vector<blk::u64> p = {stream, n};
+  for (int i = 0; i < 8; i++) p.push_back(key[i]);
+  const size_t calls = (n + 3) / 4;
+  return Buf(run("fp_chacha",
+                 "ulong call = thread_position_in_grid.x, n = p[1]; uint key[8]; for (int i = 0; i < 8; i++) key[i] = (uint)p[2 + i];"
+                 "ulong lane[4]; chacha_lanes(lane, key, (uint)call, (uint)p[0], 0, (uint)(call >> 32));"
+                 "for (ulong i = 0; i < 4 && 4 * call + i < n; i++) out[4 * call + i] = lane[i];",
+                 {words(p)}, {"p"}, {{(int)n}}, calls)[0]);
+}
+Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *theta, size_t tau) {
+  const mx::array c(cells, {(int)(m * k)}, mx::int32), t(reinterpret_cast<const int8_t *>(theta), {(int)(k * tau)}, mx::int8);
+  return Buf(run("fp_combinations",
+                 "ulong i = thread_position_in_grid.x, u = thread_position_in_grid.y, m = p[0], k = p[1], tau = p[2];"
+                 "long s = 0; for (ulong x = 0; x < k; x++) s += (long)th[x * tau + u] * (long)ce[i * k + x];"
+                 "out[u * m + i] = (s < -(1l << 17) || s >= (1l << 17)) ? ~0ul : (ulong)(s + (1l << 17));",
+                 {c, t, words(std::vector<blk::u64>{m, k, tau})}, {"ce", "th", "p"}, {{(int)(m * tau)}}, m, tau)[0]);
 }
 }

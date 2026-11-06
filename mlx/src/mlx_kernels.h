@@ -44,6 +44,11 @@ blk::E dot(const Buf &a, const Buf &b);
 void fold_round(const Buf &c, const Buf &m, size_t rows, size_t len, blk::E q[3]);
 Buf halve(const Buf &t, size_t rows, size_t len, const blk::E &g);
 blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits);
+// Words 0 .. n - 1 of a coin stream (blocks/coins/coins.h).
+Buf chacha_words(const blk::u32 key[8], blk::u32 stream, size_t n);
+// The smallness test's combinations: entry u m + i is the sum over c of theta[c tau + u] cells[i k + c],
+// plus 2^17; ~0 if it leaves the window [-2^17, 2^17).
+Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *theta, size_t tau);
 // The sum of Tensors written out, 2^vars entries of E, each thread summing one entry. The words may be
 // changed by the caller until the Buf is given to a kernel.
 Buf tensors_written(const std::vector<blk::Tensor> &tensors, unsigned vars);

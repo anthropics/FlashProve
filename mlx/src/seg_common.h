@@ -152,16 +152,17 @@ public:
     u64 off = 0;
     bool fits = true;
     for (auto *M : mats) {
-      for (u64 u = 0; u < tau; u++)
-        for (u64 i = 0; i < M->m; i++) {
-          long long comb = 0;
-          for (u64 c = 0; c < M->k; c++) comb += (long long)theta_[(col0 + c) * tau + u] * M->at(i, c);
-          if (comb < -(1 << 17) || comb >= (1 << 17)) fits = false;
-          const u64 v = (u64)(comb + (1 << 17));
-          low_[u * mz + off + i] = (u32)(v & 1023), high_[u * mz + off + i] = (u32)(v >> 10);
-          ZZ.f[u * ZZ.columns + off + i] = from_u64(v & 1023);
-          ZZ.f[u * ZZ.columns + mz + off + i] = from_u64(v >> 10);
+      const Buf v = combinations(M->cell.data(), M->m, M->k, theta_.data() + col0 * tau, tau);
+      const u64 *w = v.data();
+      psc_parallel(tau * M->m, [&](size_t a, size_t e) {
+        for (size_t x = a; x < e; x++) {
+          const u64 u = x / M->m, i = x % M->m, value = w[x];
+          low_[u * mz + off + i] = (u32)(value & 1023), high_[u * mz + off + i] = (u32)((value >> 10) & 0xFFFFFF);
+          ZZ.f[u * ZZ.columns + off + i] = from_u64(value & 1023);
+          ZZ.f[u * ZZ.columns + mz + off + i] = from_u64((value >> 10) & 0xFFFFFF);
         }
+      });
+      for (size_t x = 0; x < tau * M->m; x++) fits = fits && w[x] != ~u64(0);
       off += M->m, col0 += M->k;
     }
     if (!fits) return false;

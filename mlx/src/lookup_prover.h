@@ -52,6 +52,14 @@ inline bool lookup_multiplicities(const std::vector<LookupCall> &calls, const Lo
   m.assign(s.NC, std::vector<u32>(size_t(1) << s.kT, 0));
   for (unsigned c = 0; c < s.NC; c++) {
     const LookupCall &L = calls[c];
+    if (L.table.empty()) { // the range table: a key is its row
+      for (u64 x = 0; x < (u64(1) << L.n); x++) {
+        if (L.padding[x]) continue;
+        if (L.keys[x] >> L.k) return false;
+        m[c][L.keys[x]]++;
+      }
+      continue;
+    }
     std::unordered_map<u64, u32> row;
     for (u64 t = 0; t < (u64(1) << L.k); t++) row.emplace(L.row(t), (u32)t);
     for (u64 x = 0; x < (u64(1) << L.n); x++) {
