@@ -9,11 +9,14 @@
 //   H = sum over monomials of coeff * product of map values.
 // The first `shown` maps have end values, sent under masks; the others are kept (K).
 #pragma once
+#include <cstdlib>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <vector>
 #include "field/field.h"
 #include "iop/hp.h"
+#include "mlx_kernels.h"
 namespace fpmlx {
 using namespace blk;
 struct Monomial {
@@ -75,6 +78,12 @@ inline std::vector<E> interpolate(const std::vector<E> &v) {
   }
   return out;
 }
+// From this many values of a map, the rounds run on the GPU; below it a round's launch costs more than
+// the round. FP_PSC_GPU_MIN sets it: 0 keeps every round on the CPU.
+inline size_t &psc_gpu_min() {
+  static size_t v = [] { const char *e = getenv("FP_PSC_GPU_MIN"); return e ? (size_t)strtoull(e, nullptr, 10) : size_t(1) << 13; }();
+  return v;
+}
 // Ch: send(E), send_hiding_sum(E), epsilon(), round() -> E, y() -> E (not 0), values().
 template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob job) {
   job.start_public = ch.public_part(job.start_public);
@@ -118,20 +127,35 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
   for (const PscVar &v : job.vars) bits.push_back(v.bit);
   size_t size = job.maps.empty() ? (size_t(1) << n) : job.maps[0].size();
   std::vector<std::vector<E>> &M = job.maps;
+  std::unique_ptr<SumRounds> gpu;
+  if (psc_gpu_min() && !M.empty() && size >= psc_gpu_min() && size >= 512 && size == (size_t(1) << n)) {
+    SumShape shape;
+    for (const Monomial &m : job.summand) shape.coeff.push_back(m.coeff), shape.maps.push_back(m.maps);
+    std::vector<SumWeight> later;
+    std::vector<unsigned> at = bits;
+    for (size_t l = 0; l + 1 < n; l++) {
+      const unsigned b = at[l];
+      for (size_t t = l + 1; t < n; t++) if (at[t] > b) at[t]--;
+      later.push_back({all[l + 1].moment[0] - all[l + 1].moment[1], all[l + 1].moment[1], at[l + 1]});
+    }
+    gpu = std::make_unique<SumRounds>(M, std::move(shape), later);
+  }
   for (size_t l = 0; l < n; l++) {
+    if (gpu && (size < psc_gpu_min() || size < 512)) { gpu->fetch(M); gpu.reset(); }
     const unsigned b = bits[l], d = all[l].d, half = (unsigned)0;
     (void)half;
     const size_t step = size_t(1) << b, pairs = size / 2;
     // Weights of the other free bits: the product over the later rounds of (lo, hi).
-    std::vector<E> W(pairs, E::one());
-    for (size_t t = l + 1; t < n; t++) {
+    std::vector<E> W(gpu ? 0 : pairs, E::one());
+    for (size_t t = l + 1; t < n && !gpu; t++) {
       const unsigned bt = bits[t] > b ? bits[t] - 1 : bits[t];
       const E hi = all[t].moment[1], lo = all[t].moment[0] - all[t].moment[1];
       psc_parallel(pairs, [&, bt, hi, lo](size_t a, size_t e) { for (size_t q = a; q < e; q++) W[q] = W[q] * (((q >> bt) & 1) ? hi : lo); });
     }
     // g at the nodes 0 .. d - 1, the summand alone.
     std::vector<E> values(d, E::zero());
-    for (unsigned node = 0; node < d; node++) {
+    if (gpu) values = gpu->nodes(l, d, step);
+    for (unsigned node = 0; node < d && !gpu; node++) {
       const E x = E::from(from_u64(node));
       const unsigned T = pairs < 4096 ? 1 : std::max(1u, std::thread::hardware_concurrency());
       std::vector<E> part(T, E::zero());
@@ -174,7 +198,8 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
     slot += d - 1;
     out.challenges.push_back(r);
     // Bind bit b.
-    for (auto &m : M) {
+    if (gpu) gpu->bind(r, step);
+    else for (auto &m : M) {
       std::vector<E> next(pairs);
       psc_parallel(pairs, [&](size_t a, size_t e) {
         for (size_t q = a; q < e; q++) {
@@ -191,6 +216,7 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
     head = head * pl + poly_at(ul, r);
     psi_done = psi_done * pl;
   }
+  if (gpu) { gpu->fetch(M); gpu.reset(); }
   for (const auto &m : M) out.values.push_back(m.empty() ? E::zero() : m[0]);
   if (job.ends) out.values = job.ends(out.challenges, out.values);
   if (has_y) {

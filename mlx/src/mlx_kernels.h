@@ -43,6 +43,30 @@ blk::E dot(const Buf &a, const Buf &b);
 void fold_round(const Buf &c, const Buf &m, size_t rows, size_t len, blk::E q[3]);
 Buf halve(const Buf &t, size_t rows, size_t len, const blk::E &g);
 blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits);
+// The rounds of a sumcheck, its maps on the GPU. The summand is compiled into a kernel by its shape.
+struct SumShape {
+  std::vector<blk::E> coeff;              // by monomial
+  std::vector<std::vector<unsigned>> maps; // by monomial: indices of the maps multiplied
+};
+// The weight of a later round: (lo, hi) at the place `at` of the index that the round before it sees.
+struct SumWeight { blk::E lo, hi; unsigned at = 0; };
+class SumRounds {
+public:
+  // Takes the maps' values: `maps` are empty afterwards, until fetch(). later[l]: the weight that round
+  // l + 1 adds to round l's table; rounds = later.size() + 1.
+  SumRounds(std::vector<std::vector<blk::E>> &maps, SumShape shape, const std::vector<SumWeight> &later);
+  // g at the nodes 0 .. d - 1 of round l: the sum over the pairs along `step`, with the round's weights.
+  std::vector<blk::E> nodes(size_t l, unsigned d, size_t step);
+  void bind(const blk::E &r, size_t step);
+  void fetch(std::vector<std::vector<blk::E>> &maps) const;
+private:
+  SumShape shape_;
+  std::vector<unsigned> used_;   // the maps that the summand reads
+  mx::array m_;                  // map k's values at k * size_
+  std::vector<mx::array> w_;     // w_[l]: round l's table of weights
+  mx::array coeff_, program_;    // program_: for a summand too long to compile, its monomials as data
+  size_t count_, size_;
+};
 // blk::OracleTree with its leaves and vertices hashed on the GPU. The same draws from `coins`.
 class OracleTreeMlx {
 public:

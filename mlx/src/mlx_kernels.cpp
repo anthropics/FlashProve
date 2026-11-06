@@ -1,6 +1,7 @@
 // Copyright 2026 Anthropic PBC
 // SPDX-License-Identifier: Apache-2.0
 #include "mlx_kernels.h"
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -33,7 +34,7 @@ std::string read_kernel_header(const char *name) {
     if (l.rfind("#pragma once", 0)) out += l + "\n";
   return out;
 }
-static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal"};
+static const char *HEADERS[] = {"field.h.metal", "blake2b.h.metal", "sumcheck.h.metal"};
 static std::string all_headers() { std::string h; for (const char *f : HEADERS) h += read_kernel_header(f); return h; }
 // One kernel by name, made once. n threads, in groups of up to 256.
 static std::vector<mx::array> run(const std::string &name, const std::string &body, const std::vector<mx::array> &in, const std::vector<std::string> &names,
@@ -326,5 +327,156 @@ blk::Digest OracleTreeMlx::build_chunks(const std::vector<Buf> &chunks, size_t r
     " at += 16; bool last = at >= words_n; b2_compress(h, m, last ? total : 128ul * (step + 1), 0, last); step++; }"
     "for (int k = 0; k < 4; k++) out[4 * (ulong)x + k] = h[k];";
   return levels(run("fp_leaves_chunks_" + std::to_string(K), body, in, names, {{(int)(4 * n)}}, n)[0]);
+}
+// The rounds of a sumcheck.
+static mx::array e_array(const std::vector<blk::E> &v) { return words(reinterpret_cast<const blk::u64 *>(v.data()), 3 * v.size()); }
+static std::vector<blk::u64> e_words(const blk::E &x) { return {x.c[0].v, x.c[1].v, x.c[2].v}; }
+static mx::array e_scalars(const std::vector<blk::E> &v) { return e_array(v.empty() ? std::vector<blk::E>(1, blk::E::zero()) : v); }
+// One thread takes pairs q = tid, tid + T, ..; a group of 256 sums its threads, node by node.
+static std::string sum_source(const SumShape &s, const std::vector<unsigned> &used, unsigned d) {
+  std::ostringstream o;
+  o << "uint tid = thread_position_in_grid.x, lid = thread_position_in_threadgroup.x, grp = threadgroup_position_in_grid.x;\n"
+       "ulong pairs = p[0], step = p[1], T = p[2], size = p[3];\n"
+       "threadgroup ulong sh[768];\n";
+  for (size_t i = 0; i < s.coeff.size(); i++) o << "GlE c" << i << " = e_ld(cf, " << i << ");\n";
+  for (unsigned n = 0; n < d; n++) o << "GlE acc" << n << " = {0, 0, 0};\n";
+  o << "for (ulong q = tid; q < pairs; q += T) {\n"
+       "  ulong low = q & (step - 1), i0 = ((q - low) << 1) | low, i1 = i0 | step;\n"
+       "  GlE w = e_ld(wt, q);\n";
+  for (unsigned k : used) o << "  GlE v" << k << " = e_ld(m, " << k << " * size + i0), d" << k << " = e_sub(e_ld(m, " << k << " * size + i1), v" << k << ");\n";
+  for (unsigned n = 0; n < d; n++) {
+    o << "  {\n    GlE h = {0, 0, 0};\n";
+    for (size_t i = 0; i < s.coeff.size(); i++) {
+      o << "    { GlE t = c" << i << ";";
+      for (unsigned k : s.maps[i]) o << " t = e_mul(t, v" << k << ");";
+      o << " h = e_add(h, t); }\n";
+    }
+    o << "    acc" << n << " = e_add(acc" << n << ", e_mul(w, h));\n  }\n";
+    if (n + 1 < d) for (unsigned k : used) o << "  v" << k << " = e_add(v" << k << ", d" << k << ");\n";
+  }
+  o << "}\n";
+  for (unsigned n = 0; n < d; n++)
+    o << "{ sh[3 * lid] = acc" << n << ".c0; sh[3 * lid + 1] = acc" << n << ".c1; sh[3 * lid + 2] = acc" << n << ".c2;\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  for (uint s = 128; s > 0; s >>= 1) {\n"
+         "    if (lid < s) for (uint c = 0; c < 3; c++) sh[3 * lid + c] = gl_add(sh[3 * lid + c], sh[3 * (lid + s) + c]);\n"
+         "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+         "  }\n"
+         "  if (lid == 0) for (uint c = 0; c < 3; c++) out[((ulong)grp * " << d << " + " << n << ") * 3 + c] = sh[c];\n"
+         "  threadgroup_barrier(mem_flags::mem_threadgroup);\n}\n";
+  return o.str();
+}
+// A summand too long to unroll: its monomials are read from pg: first the offsets of each monomial's
+// factors, then the factors. A thread keeps its sums in acc[], up to 16 nodes.
+static const char *SUM_ANY = R"(
+uint tid = thread_position_in_grid.x, lid = thread_position_in_threadgroup.x, grp = threadgroup_position_in_grid.x;
+ulong pairs = p[0], step = p[1], T = p[2], size = p[3]; uint d = p[4], nm = p[5];
+threadgroup ulong sh[768];
+GlE acc[16];
+for (uint n = 0; n < d; n++) acc[n] = GlE{0, 0, 0};
+for (ulong q = tid; q < pairs; q += T) {
+  ulong low = q & (step - 1), i0 = ((q - low) << 1) | low, i1 = i0 | step;
+  GlE w = e_ld(wt, q);
+  for (uint n = 0; n < d; n++) {
+    GlE h = {0, 0, 0};
+    for (uint i = 0; i < nm; i++) {
+      GlE t = e_ld(cf, i);
+      for (ulong f = pg[i]; f < pg[i + 1]; f++) {
+        ulong at = pg[f] * size;
+        GlE a = e_ld(m, at + i0);
+        t = e_mul(t, e_add(a, e_scale(e_sub(e_ld(m, at + i1), a), (ulong)n)));
+      }
+      h = e_add(h, t);
+    }
+    acc[n] = e_add(acc[n], e_mul(w, h));
+  }
+}
+for (uint n = 0; n < d; n++) {
+  sh[3 * lid] = acc[n].c0; sh[3 * lid + 1] = acc[n].c1; sh[3 * lid + 2] = acc[n].c2;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint s = 128; s > 0; s >>= 1) {
+    if (lid < s) for (uint c = 0; c < 3; c++) sh[3 * lid + c] = gl_add(sh[3 * lid + c], sh[3 * (lid + s) + c]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (lid == 0) for (uint c = 0; c < 3; c++) out[((ulong)grp * d + n) * 3 + c] = sh[c];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+)";
+static size_t sum_factors(const SumShape &s) { size_t n = s.coeff.size(); for (const auto &m : s.maps) n += m.size(); return n; }
+static std::string sum_name(const SumShape &s, unsigned d) {
+  std::string n = "fp_sum" + std::to_string(d);
+  for (const auto &m : s.maps) { n += "_"; for (unsigned k : m) n += "x" + std::to_string(k); }
+  return n;
+}
+static mx::array sum_program(const SumShape &s) {
+  std::vector<blk::u64> p(s.maps.size() + 1);
+  p[0] = p.size();
+  for (size_t i = 0; i < s.maps.size(); i++) {
+    for (unsigned k : s.maps[i]) p.push_back(k);
+    p[i + 1] = p.size();
+  }
+  return words(p);
+}
+static mx::array packed(const std::vector<std::vector<blk::E>> &maps) {
+  const size_t each = maps[0].size() * 3;
+  BLK_REQUIRE(each * maps.size() < (size_t(1) << 31), "sumcheck: too many values for one array");
+  mx::array a(mx::allocator::malloc(each * maps.size() * 8), {(int)(each * maps.size())}, mx::uint64);
+  for (size_t k = 0; k < maps.size(); k++) memcpy(a.data<uint64_t>() + k * each, maps[k].data(), each * 8);
+  return a;
+}
+SumRounds::SumRounds(std::vector<std::vector<blk::E>> &maps, SumShape shape, const std::vector<SumWeight> &later)
+    : shape_(std::move(shape)), m_(packed(maps)), coeff_(e_scalars(shape_.coeff)), program_(sum_program(shape_)), count_(maps.size()), size_(maps[0].size()) {
+  std::vector<char> seen(maps.size(), 0);
+  for (const auto &m : shape_.maps) for (unsigned k : m) seen[k] = 1;
+  for (unsigned k = 0; k < maps.size(); k++) if (seen[k]) used_.push_back(k);
+  for (auto &m : maps) std::vector<blk::E>().swap(m);
+  // From the last round back: each table is the next one spread over one more index bit.
+  std::vector<mx::array> w(1, e_array({blk::E::one()}));
+  for (size_t l = later.size(); l-- > 0;) {
+    const SumWeight &x = later[l];
+    const size_t n = size_t(1) << (later.size() - l);
+    std::vector<blk::u64> p = {x.at};
+    for (const blk::E &e : {x.lo, x.hi}) for (blk::u64 c : e_words(e)) p.push_back(c);
+    w.push_back(run("fp_sum_weights",
+                    "uint q = thread_position_in_grid.x, at = p[0]; uint low = q & ((1u << at) - 1), below = ((q >> (at + 1)) << at) | low;"
+                    "GlE f = ((q >> at) & 1) ? GlE{p[4], p[5], p[6]} : GlE{p[1], p[2], p[3]};"
+                    "e_st(out, q, e_mul(f, e_ld(a, below)));",
+                    {w.back(), words(p)}, {"a", "p"}, {{(int)(3 * n)}}, n)[0]);
+  }
+  std::reverse(w.begin(), w.end());
+  w_ = std::move(w);
+}
+std::vector<blk::E> SumRounds::nodes(size_t l, unsigned d, size_t step) {
+  const size_t pairs = size_ / 2, T = std::min<size_t>(pairs, size_t(1) << 15), G = (T + 255) / 256;
+  BLK_REQUIRE(T % 256 == 0, "sumcheck on the GPU: too few pairs");
+  const bool any = (sum_factors(shape_) + used_.size()) * d > 96;
+  BLK_REQUIRE(d <= 16, "sumcheck on the GPU: a round of too high a degree");
+  const mx::array p = words(std::vector<blk::u64>{pairs, step, T, size_, d, shape_.coeff.size()});
+  const mx::array out = any ? run("fp_sum_any", SUM_ANY, {m_, w_[l], coeff_, program_, p}, {"m", "wt", "cf", "pg", "p"}, {{(int)(G * d * 3)}}, T)[0]
+                            : run(sum_name(shape_, d), sum_source(shape_, used_, d), {m_, w_[l], coeff_, p}, {"m", "wt", "cf", "p"}, {{(int)(G * d * 3)}}, T)[0];
+  mx::eval(out);
+  const blk::u64 *o = reinterpret_cast<const blk::u64 *>(out.data<uint64_t>());
+  std::vector<blk::E> v(d, blk::E::zero());
+  for (size_t g = 0; g < G; g++) for (unsigned n = 0; n < d; n++) v[n] = v[n] + e_at(o, g * d + n);
+  return v;
+}
+void SumRounds::bind(const blk::E &r, size_t step) {
+  const size_t pairs = size_ / 2;
+  std::vector<blk::u64> p = {step, size_, pairs};
+  for (blk::u64 c : e_words(r)) p.push_back(c);
+  m_ = run("fp_sum_bind",
+           "ulong i = thread_position_in_grid.x, row = thread_position_in_grid.y, step = p[0], size = p[1], pairs = p[2];"
+           "ulong low = i & (step - 1), i0 = row * size + (((i - low) << 1) | low), i1 = i0 + step;"
+           "GlE a = e_ld(m, i0); e_st(out, row * pairs + i, e_add(a, e_mul(GlE{p[3], p[4], p[5]}, e_sub(e_ld(m, i1), a))));",
+           {m_, words(p)}, {"m", "p"}, {{(int)(3 * pairs * count_)}}, pairs, count_)[0];
+  size_ = pairs;
+}
+void SumRounds::fetch(std::vector<std::vector<blk::E>> &maps) const {
+  mx::eval(m_);
+  maps.resize(count_);
+  for (size_t k = 0; k < count_; k++) {
+    maps[k].resize(size_);
+    memcpy((void *)maps[k].data(), m_.data<uint64_t>() + k * size_ * 3, size_ * 24);
+  }
 }
 }
