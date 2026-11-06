@@ -173,9 +173,7 @@ public:
     const Table &t = table(id);
     BLK_REQUIRE((u64(1) << ceil_log2(t.entries())) == t.entries() && v.fits(ceil_log2(t.entries())),
                 "evaluate: the vector and the table differ in length");
-    std::vector<E> w(t.entries(), E::zero());
-    write_out(v, w, ceil_log2(t.entries()));
-    return dot_with_table(w, t);
+    return dot_with_table(written_form(v, t.entries(), ceil_log2(t.entries())), t);
   }
 
   // ---- oracles ----
@@ -277,19 +275,23 @@ public:
         for (size_t i = 0; i < f->r; i++) f->tail[(p.first_row + b) * f->r + i] = cm.tail[p.part].at(b, i);
       }
     }
-    std::vector<E> dense(rows * f->ell, E::zero());
-    const unsigned vars = ceil_log2(dense.size());
+    const size_t length = rows * f->ell;
+    const unsigned vars = ceil_log2(length);
     BLK_REQUIRE(c.fits(vars), "fold: a coefficient vector has not the group's length");
-    write_out(c, dense, vars);
+    fpmlx::Buf dense = written_form(c, length, vars);
     for (const Held &h : c.held) check_hint(c, h, vars), f->hinted.push_back(h.vector);
     for (const EngineTerm &t : c.engine_terms) f->hinted.push_back(t.vector);
     for (const Tensor &v : c.tensors)
       if (v.is_held()) f->hinted.push_back(v.held);  // a dense factor stored in a table
-    std::vector<E> cc(dense.size());
-    for (size_t b = 0; b < rows; b++)
-      for (size_t i = 0; i < f->ell; i++) cc[b * f->ell + i] = dense[b + rows * i];
     f->gm = fpmlx::e_upload(f->m);
-    f->gc = fpmlx::e_upload(cc);
+    if (dense.on_gpu()) f->gc = fpmlx::rows_first(dense, rows, f->ell);
+    else {
+      const E *d = reinterpret_cast<const E *>(dense.data());
+      std::vector<E> cc(length);
+      for (size_t b = 0; b < rows; b++)
+        for (size_t i = 0; i < f->ell; i++) cc[b * f->ell + i] = d[b + rows * i];
+      f->gc = fpmlx::e_upload(cc);
+    }
     f->gt = fpmlx::e_upload(f->tail);
     f->m.clear(), f->tail.clear();
     folds_.push_back(std::move(f));
@@ -370,6 +372,32 @@ private:
   }
   // Adds c, written out on `vars` variables, to `out`, with Form::engine_terms, which only an
   // engine can read. Not checked: `out` has 2^vars entries.
+  // The Form's vector, `length` entries at the least. The Tensors are written on the GPU; what is left
+  // of a Form, its few single entries and the engine's terms, is added to the same memory.
+  fpmlx::Buf written_form(const Form &c, size_t length, unsigned vars) {
+    if (fpmlx::in_forked_child() || vars < 12 || !c.frozen.empty() || c.has_held_factor()) {
+      std::vector<E> w(length, E::zero());
+      write_out(c, w, vars);
+      const u64 *p = reinterpret_cast<const u64 *>(w.data());
+      if (fpmlx::in_forked_child()) return fpmlx::Buf(std::vector<u64>(p, p + 3 * length));
+      return fpmlx::e_upload(w);
+    }
+    fpmlx::Buf out = fpmlx::tensors_written(c.tensors, vars);
+    E *o = const_cast<E *>(reinterpret_cast<const E *>(out.data()));
+    for (const std::pair<u64, E> &e : c.entries) {
+      BLK_REQUIRE(e.first >> vars == 0, "form: an entry beyond the vector's length");
+      o[e.first] += e.second;
+    }
+    for (const EngineTerm &term : c.engine_terms) {
+      const Table &t = table(term.vector);
+      std::vector<E> w(t.entries());
+      for (u64 j = 0; j < t.entries(); j++) w[j] = t.entry(j);
+      BLK_REQUIRE(w.size() << __builtin_popcountll(term.choice_mask) == length, "engine: a term's vector has not the length that the form gives it");
+      for (u64 j = 0; j < length; j++)
+        if ((j & term.choice_mask) == term.choice_value) o[j] += engine_term_at(term, w, j, vars);
+    }
+    return out;
+  }
   void write_out(const Form &c, std::vector<E> &out, unsigned vars) {
     if (c.has_held_factor()) {
       Form host = c;
@@ -434,10 +462,11 @@ private:
     column(c.mask, c.shape.has_main() ? short_position(c.shape.log_n, c.shape.log_n_zk, x) : x, col);
     (void)main_width;
   }
-  static E dot_with_table(const std::vector<E> &w, const Table &t) {
+  static E dot_with_table(const std::vector<E> &w, const Table &t) { return dot_with_table(fpmlx::e_upload(w), t); }
+  static E dot_with_table(const fpmlx::Buf &w, const Table &t) {
     std::vector<E> entries(t.entries());
     for (u64 j = 0; j < t.entries(); j++) entries[j] = t.entry(j);
-    return fpmlx::dot(fpmlx::e_upload(w), fpmlx::e_upload(entries));
+    return fpmlx::dot(w, fpmlx::e_upload(entries));
   }
   // table() and committed() follow a loan to the lender; own_table() and own_tree() do not.
   Table &table(TableId t) {

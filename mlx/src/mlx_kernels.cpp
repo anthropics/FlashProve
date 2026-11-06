@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mlx_kernels.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -478,5 +479,111 @@ void SumRounds::fetch(std::vector<std::vector<blk::E>> &maps) const {
     maps[k].resize(size_);
     memcpy((void *)maps[k].data(), m_.data<uint64_t>() + k * size_ * 3, size_ * 24);
   }
+}
+// Writing out a Form's Tensors. A group of 256 threads owns 256 entries of the vector, which differ in
+// the 8 `lane` bits; the other bits number the group. Rows are low index bits and many Tensors fix them,
+// so the lane bits are those that the Tensors, by their size, fix least. Each group has the list of the
+// Tensors that can reach it; no two threads write one entry, and no entry is written twice.
+static const char *TENSORS = R"(
+uint lane = thread_position_in_threadgroup.x, group = threadgroup_position_in_grid.x;
+ulong lanes = p[0], chunks = p[1], j = 0;
+{ uint a = 0, b = 0;
+  for (uint t = 0; t < 63; t++) {
+    if ((lanes >> t) & 1) j |= (ulong)((lane >> a++) & 1) << t;
+    else if ((chunks >> t) & 1) j |= (ulong)((group >> b++) & 1) << t;
+  }
+}
+GlE acc = {0, 0, 0};
+for (ulong e = cs[group]; e < cs[group + 1]; e++) {
+  const ulong t = ct[e], at = 7 * t;
+  if ((j & meta[at]) != meta[at + 1]) continue;
+  GlE r = e_ld(scal, t);
+  const ulong p0 = meta[at + 2], pn = meta[at + 3];
+  for (ulong i = p0; i < p0 + pn; i++) r = e_mul(r, e_ld(pr, 2 * i + ((j >> pb[i]) & 1)));
+  const ulong d0 = meta[at + 4], dn = meta[at + 5];
+  if (dn != 0xFFFFFFFFul) {
+    ulong d = 0;
+    for (ulong i = 0; i < dn; i++) d |= ((j >> dv[d0 + i]) & 1) << i;
+    r = e_mul(r, e_ld(vals, meta[at + 6] + d));
+  }
+  acc = e_add(acc, r);
+}
+e_st(out, j, acc);
+)";
+static blk::u64 bits_taken(blk::u64 x, blk::u64 mask) { // the bits of x at mask, packed low
+  blk::u64 r = 0; unsigned n = 0;
+  for (; mask; mask &= mask - 1, n++) r |= ((x >> __builtin_ctzll(mask)) & 1) << n;
+  return r;
+}
+Buf tensors_written(const std::vector<blk::Tensor> &ts, unsigned vars) {
+  BLK_REQUIRE(vars >= 8 && vars < 31, "tensors on the GPU: a vector of this length");
+  const size_t T = ts.size();
+  // Lane bits.
+  std::vector<double> weight(vars, 0.0);
+  for (const blk::Tensor &t : ts) {
+    const double size = std::ldexp(1.0, (int)(vars - __builtin_popcountll(t.pick_mask())));
+    for (unsigned b = 0; b < vars; b++) if (t.picks(b)) weight[b] += size;
+  }
+  std::vector<unsigned> order(vars);
+  for (unsigned b = 0; b < vars; b++) order[b] = b;
+  std::stable_sort(order.begin(), order.end(), [&](unsigned a, unsigned b) { return weight[a] < weight[b]; });
+  blk::u64 lanes = 0;
+  for (unsigned i = 0; i < 8; i++) lanes |= blk::u64(1) << order[i];
+  const blk::u64 all = (blk::u64(1) << vars) - 1, chunks = all & ~lanes;
+  const size_t C = size_t(1) << (vars - 8);
+  // The Tensors as data.
+  std::vector<blk::u64> meta(7 * std::max<size_t>(T, 1), 0), pb, dv, vals;
+  std::vector<blk::E> scal, pr;
+  std::map<const std::vector<blk::E> *, blk::u64> placed;
+  for (size_t i = 0; i < T; i++) {
+    const blk::Tensor &t = ts[i];
+    BLK_REQUIRE(t.vars() == vars && !t.is_held(), "tensors on the GPU: another length, or a held factor");
+    blk::u64 *m = &meta[7 * i];
+    m[0] = t.pick_mask(), m[1] = t.pick_value(), m[2] = pb.size();
+    const blk::E *real = t.real_pairs();
+    unsigned r = 0;
+    for (unsigned b = 0; b < vars; b++) {
+      if (t.picks(b)) continue;
+      const blk::E &lo = real[2 * r], &hi = real[2 * r + 1];
+      r++;
+      if (lo == blk::E::one() && hi == blk::E::one()) continue;
+      pb.push_back(b), pr.push_back(lo), pr.push_back(hi);
+    }
+    m[3] = pb.size() - m[2];
+    scal.push_back(t.scalar);
+    m[5] = 0xFFFFFFFFul;
+    if (t.has_dense()) {
+      m[4] = dv.size(), m[5] = t.dense_vars.size();
+      for (unsigned d : t.dense_vars) dv.push_back(d);
+      auto it = placed.find(t.values.get());
+      if (it == placed.end()) {
+        it = placed.emplace(t.values.get(), vals.size() / 3).first;
+        const blk::u64 *w = reinterpret_cast<const blk::u64 *>(t.values->data());
+        vals.insert(vals.end(), w, w + 3 * t.values->size());
+      }
+      m[6] = it->second + t.first;
+    }
+  }
+  // Which Tensors reach which group.
+  std::vector<blk::u64> cs(C + 1, 0), ct;
+  auto each_chunk = [&](const blk::Tensor &t, auto &&body) {
+    const blk::u64 fixed = bits_taken(t.pick_mask(), chunks), value = bits_taken(t.pick_value(), chunks), free = (C - 1) & ~fixed;
+    blk::u64 sub = 0;
+    do { body(sub | value); sub = (sub - free) & free; } while (sub);
+  };
+  for (const blk::Tensor &t : ts) each_chunk(t, [&](blk::u64 c) { cs[c + 1]++; });
+  for (size_t c = 0; c < C; c++) cs[c + 1] += cs[c];
+  ct.resize(std::max<blk::u64>(cs[C], 1));
+  { std::vector<blk::u64> at(cs.begin(), cs.end() - 1);
+    for (size_t i = 0; i < T; i++) each_chunk(ts[i], [&](blk::u64 c) { ct[at[c]++] = i; }); }
+  auto some = [](std::vector<blk::u64> &v) -> std::vector<blk::u64> & { if (v.empty()) v.push_back(0); return v; };
+  return Buf(run("fp_tensors", TENSORS,
+                 {words(meta), e_scalars(scal), e_scalars(pr), words(some(pb)), words(some(dv)), words(some(vals)), words(cs), words(ct), words(std::vector<blk::u64>{lanes, chunks})},
+                 {"meta", "scal", "pr", "pb", "dv", "vals", "cs", "ct", "p"}, {{(int)(3 * (size_t(1) << vars))}}, size_t(1) << vars)[0]);
+}
+Buf rows_first(const Buf &dense, size_t rows, size_t ell) {
+  return Buf(run("fp_rows_first",
+                 "ulong b = thread_position_in_grid.x, i = thread_position_in_grid.y, rows = p[0], ell = p[1]; e_st(out, b * ell + i, e_ld(a, b + rows * i));",
+                 {dense.array(), words(std::vector<blk::u64>{rows, ell})}, {"a", "p"}, {{(int)(3 * rows * ell)}}, rows, ell)[0]);
 }
 }

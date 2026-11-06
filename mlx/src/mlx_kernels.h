@@ -9,6 +9,7 @@
 #include <vector>
 #include "field/field.h"
 #include "hash/hash.h"
+#include "iop/tensor.h"
 #include "tree/opening.h"
 namespace fpmlx {
 namespace mx = mlx::core;
@@ -43,6 +44,11 @@ blk::E dot(const Buf &a, const Buf &b);
 void fold_round(const Buf &c, const Buf &m, size_t rows, size_t len, blk::E q[3]);
 Buf halve(const Buf &t, size_t rows, size_t len, const blk::E &g);
 blk::u64 search_nonce(const blk::ChainPrefix &prefix, unsigned bits);
+// The sum of Tensors written out, 2^vars entries of E, each thread summing one entry. The words may be
+// changed by the caller until the Buf is given to a kernel.
+Buf tensors_written(const std::vector<blk::Tensor> &tensors, unsigned vars);
+// entry b + rows i of `dense` to place b ell + i, for b < rows, i < ell.
+Buf rows_first(const Buf &dense, size_t rows, size_t ell);
 // The rounds of a sumcheck, its maps on the GPU. The summand is compiled into a kernel by its shape.
 struct SumShape {
   std::vector<blk::E> coeff;              // by monomial
