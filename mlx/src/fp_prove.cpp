@@ -90,6 +90,8 @@ int main(int argc, char **argv) {
     auto leaf_coins = seeded_coins(seed, COINS_LEAF);
     // A request's masks must be fresh: two proofs under one mask would show differences of hidden values.
     auto coins = run_coins_without_a_seed<MetalCoins>(CoinInputs().add("a request", req).finish(), CoinContext{});
+    // MLX keeps freed buffers for reuse, by default as much again as is in use.
+    mx::set_cache_limit((size_t)(atof(getenv("FP_MLX_CACHE_GB") ? getenv("FP_MLX_CACHE_GB") : "4") * 1e9));
     EngineMlx engine;
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     IndexMlx table(S, M, *leaf_coins, c.configuration());
