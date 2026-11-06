@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
     const CoinKey seed = load_or_make_seed(seedf.c_str());
     auto leaf_coins = seeded_coins(seed, COINS_LEAF);
     // A request's masks must be fresh: two proofs under one mask would show differences of hidden values.
-    auto coins = run_coins_without_a_seed<StreamCoins>(CoinInputs().add("a request", req).finish(), CoinContext{});
+    auto coins = run_coins_without_a_seed<MetalCoins>(CoinInputs().add("a request", req).finish(), CoinContext{});
     EngineMlx engine;
     const NonceSearch search = [&](const ChainPrefix &p, unsigned bits) { return engine.search_nonce(p, bits); };
     IndexMlx table(S, M, *leaf_coins, c.configuration());
@@ -273,6 +273,7 @@ int main(int argc, char **argv) {
     }
     io.close_stream();
     printf("proof: %zu bytes, %.1f s in all\n", file.size(), now() - t0);
+    printf("GPU memory: peak %.2f GB, active %.2f GB, cache %.2f GB\n", mx::get_peak_memory() / 1e9, mx::get_active_memory() / 1e9, mx::get_cache_memory() / 1e9);
     return 0;
   });
 }

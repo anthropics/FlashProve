@@ -42,6 +42,9 @@ struct PscJob {
   std::function<E(const std::vector<E> &values)> at_end;
   // Masks of the end values, if they are not the mask row's entries (the merge's index-mask entry).
   std::vector<E> end_masks;
+  // In place of `maps`: maps already on the GPU, device_maps of equal length, one after another.
+  std::shared_ptr<mx::array> device;
+  unsigned device_maps = 0;
 };
 struct PscResult {
   std::vector<E> challenges; // gamma_l in the order of the rounds, without Y
@@ -125,10 +128,17 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
   // Maps' index: the bits that are still free, compacted in order as they are bound.
   std::vector<unsigned> bits;
   for (const PscVar &v : job.vars) bits.push_back(v.bit);
-  size_t size = job.maps.empty() ? (size_t(1) << n) : job.maps[0].size();
+  size_t size = job.device ? job.device->size() / 3 / job.device_maps : job.maps.empty() ? (size_t(1) << n) : job.maps[0].size();
   std::vector<std::vector<E>> &M = job.maps;
   std::unique_ptr<SumRounds> gpu;
-  if (psc_gpu_min() && !M.empty() && size >= psc_gpu_min() && size >= 512 && size == (size_t(1) << n)) {
+  const bool on_card = psc_gpu_min() && size >= psc_gpu_min() && size >= 512;
+  if (job.device && !on_card) { // too short to be worth a launch
+    const std::vector<E> all_values = e_fetch(*job.device);
+    M.resize(job.device_maps);
+    for (unsigned k = 0; k < job.device_maps; k++) M[k].assign(all_values.begin() + k * size, all_values.begin() + (k + 1) * size);
+    job.device.reset();
+  }
+  if (on_card && (!M.empty() || job.device) && size >= 512 && size == (size_t(1) << n)) {
     SumShape shape;
     for (const Monomial &m : job.summand) shape.coeff.push_back(m.coeff), shape.maps.push_back(m.maps);
     std::vector<SumWeight> later;
@@ -138,7 +148,8 @@ template <class Ch> PscResult psc_run(Ch &ch, const E *mask, u32 &slot, PscJob j
       for (size_t t = l + 1; t < n; t++) if (at[t] > b) at[t]--;
       later.push_back({all[l + 1].moment[0] - all[l + 1].moment[1], all[l + 1].moment[1], at[l + 1]});
     }
-    gpu = std::make_unique<SumRounds>(M, std::move(shape), later);
+    gpu = job.device ? std::make_unique<SumRounds>(*job.device, job.device_maps, std::move(shape), later) : std::make_unique<SumRounds>(M, std::move(shape), later);
+    job.device.reset();
   }
   for (size_t l = 0; l < n; l++) {
     if (gpu && (size < psc_gpu_min() || size < 512)) { gpu->fetch(M); gpu.reset(); }

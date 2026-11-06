@@ -54,6 +54,24 @@ Buf combinations(const int32_t *cells, size_t m, size_t k, const signed char *th
 Buf tensors_written(const std::vector<blk::Tensor> &tensors, unsigned vars);
 // entry b + rows i of `dense` to place b ell + i, for b < rows, i < ell.
 Buf rows_first(const Buf &dense, size_t rows, size_t ell);
+// A lookup's product trees. Level m has 2^m vertices; a vertex is the product of two of the level below,
+// i and i + 2^m, so the level below is two maps of the level's length, one after the other.
+mx::array product_level(const mx::array &below);
+std::vector<blk::E> e_fetch(const mx::array &a);
+mx::array e_on_gpu(const std::vector<blk::E> &v);
+// The key side's leaves, alpha - (value + call theta): position i = y + 2^rK x; see lookup_run().
+struct LeafPlan {
+  unsigned rK = 0, dT = 0, v = 0;
+  blk::u64 NT = 0;
+  blk::E alpha, theta, pad0;
+  std::vector<blk::u64> tree_call, tree_first; // by tree y: its call, and the place of its first key in `keys`
+  std::vector<blk::u64> pad_value;             // by call: the value of the padding row
+};
+mx::array lookup_leaves(const LeafPlan &p, const std::vector<blk::u64> &keys, const std::vector<char> &padding);
+// Smallness::u3(): entry c nb + b is the sum over r < len of phi[r] cells[(b len + r) k + c].
+Buf column_sums(const int32_t *cells, size_t k, size_t nb, const std::vector<blk::E> &phi);
+// g^T M on a matrix of signed bytes, rows x columns.
+Buf bytes_left(const int8_t *cells, size_t rows, size_t columns, const std::vector<blk::E> &g);
 // The rounds of a sumcheck, its maps on the GPU. The summand is compiled into a kernel by its shape.
 struct SumShape {
   std::vector<blk::E> coeff;              // by monomial
@@ -66,11 +84,14 @@ public:
   // Takes the maps' values: `maps` are empty afterwards, until fetch(). later[l]: the weight that round
   // l + 1 adds to round l's table; rounds = later.size() + 1.
   SumRounds(std::vector<std::vector<blk::E>> &maps, SumShape shape, const std::vector<SumWeight> &later);
+  // Maps already on the GPU: `count` maps of equal length, one after another.
+  SumRounds(const mx::array &maps, unsigned count, SumShape shape, const std::vector<SumWeight> &later);
   // g at the nodes 0 .. d - 1 of round l: the sum over the pairs along `step`, with the round's weights.
   std::vector<blk::E> nodes(size_t l, unsigned d, size_t step);
   void bind(const blk::E &r, size_t step);
   void fetch(std::vector<std::vector<blk::E>> &maps) const;
 private:
+  void prepare(const std::vector<SumWeight> &later);
   SumShape shape_;
   std::vector<unsigned> used_;   // the maps that the summand reads
   mx::array m_;                  // map k's values at k * size_

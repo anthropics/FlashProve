@@ -89,27 +89,34 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
   const E &alpha = o.alpha, &theta = o.theta;
   auto keyed = [&](unsigned c, u64 value) { return E::from(from_u64(value)) + E::from(from_u64(c)) * theta; };
   const u64 nv = u64(1) << s.v;
-  // The key side's levels: level m has 2^m vertices. leaves: (x | y).
-  std::vector<std::vector<E>> K(s.v + 1);
-  K[s.v].resize(nv);
+  // The key side's levels, on the GPU: level m has 2^m vertices. leaves: (x | y).
+  std::vector<mx::array> K;
   const E pad0 = alpha - keyed(0, calls[0].row(calls[0].t0));
-  psc_parallel(nv, [&](size_t a, size_t e) {
-    for (size_t i = a; i < e; i++) {
-      const u64 y = i & ((u64(1) << s.rK) - 1), x = i >> s.rK;
-      if (y >= s.NT) { K[s.v][i] = pad0; continue; }
-      const unsigned c = s.call_of[y];
-      const u64 key = (y - s.tree0[c]) << s.dT | x;
-      K[s.v][i] = alpha - keyed(c, calls[c].padding[key] ? calls[c].row(calls[c].t0) : calls[c].keys[key]);
+  {
+    LeafPlan L;
+    L.rK = s.rK, L.dT = s.dT, L.v = s.v, L.NT = s.NT, L.alpha = alpha, L.theta = theta, L.pad0 = pad0;
+    std::vector<u64> first(s.NC);
+    std::vector<u64> keys;
+    std::vector<char> padding;
+    for (unsigned c = 0; c < s.NC; c++) {
+      first[c] = keys.size();
+      keys.insert(keys.end(), calls[c].keys.begin(), calls[c].keys.end());
+      padding.insert(padding.end(), calls[c].padding.begin(), calls[c].padding.end());
+      L.pad_value.push_back(calls[c].row(calls[c].t0));
     }
-  });
-  for (int m = (int)s.v - 1; m >= 0; m--) {
-    K[m].resize(size_t(1) << m);
-    const size_t h = size_t(1) << m;
-    psc_parallel(h, [&](size_t a, size_t e) { for (size_t i = a; i < e; i++) K[m][i] = K[m + 1][i] * K[m + 1][i + h]; });
+    // Tree y holds the call's keys from (y - tree0) 2^dT on, x being the key's low bits.
+    for (u64 y = 0; y < s.NT; y++) {
+      const unsigned c = s.call_of[y];
+      L.tree_call.push_back(c), L.tree_first.push_back(first[c] + ((y - s.tree0[c]) << s.dT));
+    }
+    K.assign(s.v + 1, mx::array(0));
+    K[s.v] = lookup_leaves(L, keys, padding);
+    for (int m = (int)s.v - 1; m >= 0; m--) K[m] = product_level(K[m + 1]);
   }
+  const E K00 = e_fetch(K[0])[0];
   // The table side: leaves (t | c | j).
   const unsigned nT = 5 + s.dL;
-  std::vector<std::vector<E>> Tt(nT + 1);
+  std::vector<mx::array> Tt;
   std::vector<E> bits(size_t(1) << nT, E::zero()), rowA(size_t(1) << nT);
   for (u64 t = 0; t < (u64(1) << s.kT); t++)
     for (u64 c = 0; c < (u64(1) << s.cK); c++) {
@@ -121,14 +128,14 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
         if (c < s.NC && ((mult[c][t] >> j) & 1)) bits[i] = E::one();
       }
     }
-  Tt[nT].resize(size_t(1) << nT);
-  for (size_t i = 0; i < Tt[nT].size(); i++) Tt[nT][i] = E::one() + bits[i] * rowA[i];
-  for (int m = (int)nT - 1; m >= 5; m--) {
-    Tt[m].resize(size_t(1) << m);
-    const size_t h = size_t(1) << m;
-    for (size_t i = 0; i < h; i++) Tt[m][i] = Tt[m + 1][i] * Tt[m + 1][i + h];
+  {
+    std::vector<E> leaves(size_t(1) << nT);
+    psc_parallel(leaves.size(), [&](size_t a, size_t e) { for (size_t i = a; i < e; i++) leaves[i] = E::one() + bits[i] * rowA[i]; });
+    Tt.assign(nT + 1, mx::array(0));
+    Tt[nT] = e_on_gpu(leaves);
+    for (int m = (int)nT - 1; m >= 5; m--) Tt[m] = product_level(Tt[m + 1]);
   }
-  const std::vector<E> &G = Tt[5];
+  const std::vector<E> G = e_fetch(Tt[5]);
   // a_pad.
   E apad = E::one();
   {
@@ -148,7 +155,7 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
     j.shown = q == 0 ? 3 : 2;
     j.degree_y = 3;
     if (q == 0) {
-      j.maps = {{K[0][0]}, {P[1]}, {G[0]}};
+      j.maps = {{K00}, {P[1]}, {G[0]}};
       j.summand = {{E::one(), {0}}, {E::zero() - apad, {1, 1, 2}}};
       j.start_value = E::zero(), j.start_public = E::zero();
     } else {
@@ -171,10 +178,9 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
     CT = CT + w * G[jn], CTpub = CTpub + w * shownG[jn];
   }
   // A product level, the maps being the two halves of the level below.
-  auto level = [&](const std::vector<E> &below, unsigned m, std::vector<E> &z, E &C, E &Cpub, const std::vector<unsigned> &order) {
+  auto level = [&](const mx::array &below, unsigned m, std::vector<E> &z, E &C, E &Cpub, const std::vector<unsigned> &order) {
     PscJob j;
-    const size_t h = size_t(1) << m;
-    j.maps = {std::vector<E>(below.begin(), below.begin() + h), std::vector<E>(below.begin() + h, below.begin() + 2 * h)};
+    j.device = std::make_shared<mx::array>(below), j.device_maps = 2;
     j.shown = 2, j.degree_y = 2;
     j.summand = {{E::one(), {0, 1}}};
     for (unsigned l = 0; l < m; l++) j.vars.push_back({Weight<E>::equality(z[m - 1 - order[l]], 3), order[l]});
@@ -191,7 +197,7 @@ template <class Ch> LookupOut lookup_run(Ch &ch, const E *mask, u32 &slot, const
   auto default_order = [](unsigned m) { std::vector<unsigned> o; for (unsigned b = m; b-- > 0;) o.push_back(b); return o; };
   // Step 5.
   std::vector<E> zK;
-  E CK = K[0][0], CKpub = shownZ;
+  E CK = K00, CKpub = shownZ;
   for (unsigned m = 0; m < s.v; m++) {
     std::vector<unsigned> order = default_order(m);
     if (m == s.v - 1) {

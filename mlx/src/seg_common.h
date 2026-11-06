@@ -122,14 +122,8 @@ public:
       const CellMatrix2 &M = *mats[p.mat];
       const u64 len = p.phi.size(), nb = M.m / len, at = out.size();
       out.resize(at + M.k * nb, E::zero());
-      psc_parallel(M.k, [&](size_t a, size_t e) {
-        for (size_t c = a; c < e; c++)
-          for (u64 b = 0; b < nb; b++) {
-            E s = E::zero();
-            for (u64 r = 0; r < len; r++) if (const int32_t v = M.at(b * len + r, c)) s = s + p.phi[r] * from_i64(v);
-            out[at + c * nb + b] = s;
-          }
-      });
+      const std::vector<E> sums = e_download(column_sums(M.cell.data(), M.k, nb, p.phi));
+      std::copy(sums.begin(), sums.end(), out.begin() + at);
     }
     return out;
   }

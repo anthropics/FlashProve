@@ -123,15 +123,15 @@ public:
   void begin(const std::vector<std::vector<Tensor>> &g) override {
     w_.clear();
     for (const std::vector<Tensor> &x : g) {
-      std::vector<E> gv(size_t(1) << S_.k_row(), E::zero());
-      for (const Tensor &t : x) t.add_to(gv.data());
+      const unsigned vars = S_.k_row();
+      std::vector<E> gv;
+      if (vars >= 12) gv = e_download(tensors_written(x, vars));
+      else {
+        gv.assign(size_t(1) << vars, E::zero());
+        for (const Tensor &t : x) t.add_to(gv.data());
+      }
       gv.resize(S_.matrix_rows);
-      std::vector<E> w(M_.columns, E::zero());
-      in_parallel(M_.columns, [&](u64 c) {
-        E s = E::zero();
-        for (u64 y = 0; y < M_.rows; y++) if (!(gv[y] == E::zero())) s += gv[y] * from_i64(M_.cells[y * M_.columns + c]);
-        w[c] = s;
-      });
+      std::vector<E> w = e_download(bytes_left(M_.cells, M_.rows, M_.columns, gv));
       w_.push_back(std::move(w));
     }
   }
